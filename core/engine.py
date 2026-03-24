@@ -1,319 +1,364 @@
 from __future__ import annotations
 
+import math
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 
-from core.config import ScanConfig
-from core.divergence import best_divergence, detect_bearish_divergence, detect_bullish_divergence
-from core.fibonacci import build_fib_levels, build_swing_from_divergence, fib_zone_status, trade_levels
-from core.indicators import recent_pump_pct, rsi, volume_ratio
-from core.scoring import score_candidate
-from core.swings import swing_cleanliness
+from core.config import APP_VERSION, MAIN_PROFILE, SUB_PROFILE, ScanProfile
 from services.binance import BinanceService
 
 
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(method="bfill").fillna(50.0)
+
+def _df(ohlcv: List[List[float]]) -> pd.DataFrame:
+    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+    df["rsi"] = _rsi(df["close"])
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema60"] = df["close"].ewm(span=60, adjust=False).mean()
+    return df
+
+def _quote_volume_1h(df: pd.DataFrame, bars: int = 24) -> float:
+    t = df.tail(bars)
+    return float((t["close"] * t["volume"]).sum())
+
+def _recent_pivots(series: pd.Series, left: int = 3, right: int = 3, kind: str = "low") -> List[int]:
+    vals = series.values
+    pivots = []
+    for i in range(left, len(vals) - right):
+        window = vals[i-left:i+right+1]
+        center = vals[i]
+        if kind == "low":
+            if np.nanmin(window) == center and np.sum(window == center) == 1:
+                pivots.append(i)
+        else:
+            if np.nanmax(window) == center and np.sum(window == center) == 1:
+                pivots.append(i)
+    return pivots[-8:]
+
+def _bullish_divergence(df: pd.DataFrame) -> Tuple[bool, bool, List[str]]:
+    lows = _recent_pivots(df["low"], kind="low")
+    reasons = []
+    if len(lows) < 2:
+        return False, False, reasons
+    i1, i2 = lows[-2], lows[-1]
+    p1, p2 = float(df["low"].iloc[i1]), float(df["low"].iloc[i2])
+    r1, r2 = float(df["rsi"].iloc[i1]), float(df["rsi"].iloc[i2])
+    basic = p2 < p1 and r2 > r1
+    linked = False
+    if len(lows) >= 3:
+        i0 = lows[-3]
+        p0 = float(df["low"].iloc[i0]); r0 = float(df["rsi"].iloc[i0])
+        linked = (p2 <= p1 <= p0) and (r2 >= r1 >= r0)
+    if basic:
+        reasons.append("상승 다이버전스")
+    if linked:
+        reasons.append("연계 다이버전스")
+    return basic, linked, reasons
+
+def _fib_metrics(df: pd.DataFrame) -> Dict[str, float]:
+    lows = _recent_pivots(df["low"], kind="low")
+    highs = _recent_pivots(df["high"], kind="high")
+    if not lows or not highs:
+        raise ValueError("스윙 부족")
+    low_i = lows[-1]
+    high_i = None
+    for h in reversed(highs):
+        if h < low_i:
+            high_i = h
+            break
+    if high_i is None:
+        # fallback: use rolling high before last 12 bars
+        high_i = int(df["high"].iloc[:-12].idxmax())
+    high = float(df["high"].iloc[high_i])
+    low = float(df["low"].iloc[low_i])
+    if high <= low:
+        raise ValueError("스윙 고저 비정상")
+    current = float(df["close"].iloc[-1])
+    diff = high - low
+    fib_618 = high - diff * 0.618
+    fib_786 = high - diff * 0.786
+    fib_1 = low
+    return {
+        "high": high, "low": low, "current": current,
+        "fib_618": fib_618, "fib_786": fib_786, "fib_1": fib_1,
+        "in_zone": float(fib_786 <= current <= fib_618),
+    }
+
+def _stage1_quick_symbol(symbol: str, svc: BinanceService, profile: ScanProfile) -> Dict:
+    df = _df(svc.fetch_ohlcv(symbol, "1h", limit=180))
+    qv = _quote_volume_1h(df, 24)
+    last = float(df["close"].iloc[-1])
+    rsi = float(df["rsi"].iloc[-1])
+    low20 = float(df["low"].tail(20).min())
+    high20 = float(df["high"].tail(20).max())
+    range_pct = 0.0 if low20 <= 0 else (high20 - low20) / low20 * 100
+    volume_ratio = float(df["volume"].tail(5).mean() / max(df["volume"].tail(20).mean(), 1e-9))
+    basic_div, linked_div, div_reasons = _bullish_divergence(df)
+
+    score = 0.0
+    reasons, warnings, rejected_by = [], [], []
+
+    if qv >= profile.min_quote_volume:
+        score += 1.0
+        reasons.append("최소 거래대금 통과")
+    else:
+        rejected_by.append("quote_volume_low")
+
+    if profile.stage1_rsi_low <= rsi <= profile.stage1_rsi_high:
+        score += 1.0
+        reasons.append("RSI 선별 통과")
+    else:
+        rejected_by.append("rsi_out_of_range")
+
+    if last > float(df["ema20"].iloc[-1]) or float(df["ema20"].iloc[-1]) > float(df["ema60"].iloc[-1]):
+        score += 0.5
+        reasons.append("단기 구조 훼손 아님")
+
+    if volume_ratio >= 1.05:
+        score += 0.5
+        reasons.append("거래량 최근 개선")
+    else:
+        warnings.append("거래량 개선 약함")
+
+    if range_pct > 35:
+        warnings.append("단기 변동성 과열 가능")
+    else:
+        score += 0.5
+
+    if basic_div:
+        score += 1.0
+        reasons.extend(div_reasons)
+    if linked_div:
+        score += 1.5
+
+    passed = score >= profile.stage1_score_min and "quote_volume_low" not in rejected_by
+
+    return {
+        "symbol": symbol.replace("/", ""),
+        "symbol_ccxt": symbol,
+        "passed": passed,
+        "stage1_score": round(score, 2),
+        "reasons": reasons,
+        "warnings": warnings,
+        "rejected_by": rejected_by,
+        "last": round(last, 8),
+        "quote_volume_24h_est": round(qv, 2),
+        "rsi": round(rsi, 2),
+    }
+
+def _precise_symbol(symbol_ccxt: str, mode: str, svc: BinanceService) -> Dict:
+    df1 = _df(svc.fetch_ohlcv(symbol_ccxt, "1h", limit=220))
+    df30 = _df(svc.fetch_ohlcv(symbol_ccxt, "30m", limit=220))
+    df4 = _df(svc.fetch_ohlcv(symbol_ccxt, "4h", limit=220))
+
+    reasons, warnings, rejected_by, downgraded_by = [], [], [], []
+    basic1, linked1, div1 = _bullish_divergence(df1)
+    basic30, linked30, div30 = _bullish_divergence(df30)
+    basic4, linked4, div4 = _bullish_divergence(df4)
+
+    fib = _fib_metrics(df1)
+    current = fib["current"]
+    stop = fib["fib_1"]
+    stop_pct = ((stop - current) / current) * 100
+
+    score = 0.0
+    if basic1:
+        score += 2.0; reasons.append("1시간봉 상승 다이버전스")
+    else:
+        rejected_by.append("divergence_1h_missing")
+
+    if linked1:
+        score += 2.0; reasons.append("1시간봉 연계 다이버전스")
+    if basic30:
+        score += 1.0; reasons.append("30분봉 재확인")
+    if linked30:
+        score += 1.0; reasons.append("30분봉 연계")
+    if basic4:
+        score += 0.5; reasons.append("4시간봉 보조 확인")
+
+    if fib["in_zone"] == 1.0:
+        score += 2.0; reasons.append("Fib 0.618~0.786 구간")
+    else:
+        downgraded_by.append("fib_zone_miss")
+
+    if -12.0 <= stop_pct <= -1.0:
+        score += 1.0
+    else:
+        rejected_by.append("stop_range_invalid")
+
+    # targets by simple structure
+    high = fib["high"]; diff = high - stop
+    tp1 = current + diff * 0.382
+    tp2 = current + diff * 0.618
+    tp3 = current + diff * 1.0
+    tp1_pct = ((tp1 - current) / current) * 100
+    tp2_pct = ((tp2 - current) / current) * 100
+    tp3_pct = ((tp3 - current) / current) * 100
+
+    rr1 = abs(tp1_pct / stop_pct) if stop_pct < 0 else None
+    rr2 = abs(tp2_pct / stop_pct) if stop_pct < 0 else None
+    rr3 = abs(tp3_pct / stop_pct) if stop_pct < 0 else None
+
+    if rr1 is not None and rr1 >= 1.3:
+        score += 1.0; reasons.append("손익비 1차 기준 통과")
+    else:
+        downgraded_by.append("rr1_low")
+
+    state = "watch"
+    passed = False
+    if mode == "main":
+        if score >= MAIN_PROFILE.final_score_min and not rejected_by:
+            state = "ready"; passed = True
+        elif score >= max(MAIN_PROFILE.final_score_min - 1.5, 4.5) and MAIN_PROFILE.allow_watch:
+            state = "watch"
+        else:
+            state = "reject"
+    else:
+        if score >= SUB_PROFILE.final_score_min and not rejected_by:
+            state = "ready"; passed = True
+        elif score >= max(SUB_PROFILE.final_score_min - 1.0, 3.0):
+            state = "watch"
+        else:
+            state = "reject"
+
+    if not passed and state != "watch":
+        msg = f"현재 {mode} 조건 미충족"
+    elif state == "watch":
+        msg = f"현재 {mode} 관찰 후보"
+    else:
+        msg = f"현재 {mode} 진입 후보"
+
+    return {
+        "symbol": symbol_ccxt.replace("/", ""),
+        "mode": mode,
+        "passed": passed,
+        "state": state,
+        "direction": "long",
+        "score": round(score, 2),
+        "entry_reference_price": round(current, 8),
+        "stop_pct": round(stop_pct, 2),
+        "tp1_pct": round(tp1_pct, 2),
+        "tp2_pct": round(tp2_pct, 2),
+        "tp3_pct": round(tp3_pct, 2),
+        "rr1": round(rr1, 2) if rr1 is not None else None,
+        "rr2": round(rr2, 2) if rr2 is not None else None,
+        "rr3": round(rr3, 2) if rr3 is not None else None,
+        "message": msg,
+        "reasons": reasons,
+        "warnings": warnings,
+        "rejected_by": rejected_by,
+        "downgraded_by": downgraded_by,
+    }
+
 class PresidentTradingEngine:
-    def __init__(self, service: Optional[BinanceService] = None) -> None:
-        self.service = service or BinanceService()
+    def __init__(self) -> None:
+        self.svc = BinanceService()
 
-    def _prepare(self, df: pd.DataFrame, rsi_period: int) -> pd.DataFrame:
-        out = df.copy()
-        out["rsi"] = rsi(out["close"], period=rsi_period)
-        return out
-
-    def _approx_quote_volume_usdt(self, df: pd.DataFrame, bars: int = 24) -> float:
-        if df.empty:
-            return 0.0
-        seg = df.tail(bars)
-        return float((seg["close"] * seg["volume"]).sum())
-
-    def _level_gap_pct(self, df: pd.DataFrame, reference_price: float, side: str) -> float:
-        lookback = df.tail(50)
-        if lookback.empty or reference_price <= 0:
-            return 0.0
-        if side == "long":
-            resistance = float(lookback["high"].max())
-            return (resistance - reference_price) / reference_price * 100
-        support = float(lookback["low"].min())
-        return (reference_price - support) / reference_price * 100
-
-    def _build_no_signal_response(self, symbol: str, mode: str, message: str, *, warnings: Optional[List[str]] = None) -> Dict:
-        return {
-            "status": "ok",
-            "symbol": symbol,
-            "mode": mode,
-            "passed": False,
-            "state": "no_signal",
-            "message": message,
-            "warnings": warnings or [],
-            "errors": [],
-        }
-
-    def _build_symbol_error(self, symbol: str, mode: str, exc: Exception) -> Dict:
-        return {
-            "status": "partial",
-            "symbol": symbol,
-            "mode": mode,
-            "passed": False,
-            "state": "error",
-            "message": "심볼 분석 실패",
-            "warnings": [],
-            "errors": [f"{symbol}: {type(exc).__name__}: {str(exc)}"],
-        }
-
-    def _load_1h_context(self, symbol: str, cfg: ScanConfig):
-        df_1h = self._prepare(self.service.ohlcv(symbol, "1h", cfg.lookback_bars), cfg.rsi_period)
-        div_1h = best_divergence(df_1h, pivot_window=cfg.pivot_window, min_spacing=cfg.min_pivot_spacing)
-        if not div_1h:
-            return df_1h, None, None, None, None
-        side = div_1h["side"]
-        swing = build_swing_from_divergence(div_1h, df_1h, structure_lookback_bars=cfg.structure_lookback_bars)
-        if not swing:
-            return df_1h, div_1h, side, None, None
-        current_price = float(df_1h["close"].iloc[-1])
-        levels = build_fib_levels(swing["swing_low"], swing["swing_high"], side=side)
-        zone = fib_zone_status(current_price, levels, cfg.fib_zone_low, cfg.fib_zone_high, side)
-        return df_1h, div_1h, side, swing, {"levels": levels, "zone": zone, "current_price": current_price}
+    def _profile(self, mode: str) -> ScanProfile:
+        return MAIN_PROFILE if mode == "main" else SUB_PROFILE
 
     def analyze_symbol(self, symbol: str, mode: str = "main") -> Dict:
+        if "/" not in symbol:
+            symbol = symbol.replace("USDT", "/USDT")
         try:
-            cfg = ScanConfig(mode=mode)
-            df_1h, div_1h, side, swing, ctx = self._load_1h_context(symbol, cfg)
-            if not div_1h:
-                return self._build_no_signal_response(symbol, mode, "1시간봉 유효 다이버전스 없음")
-            if not swing or not ctx:
-                return self._build_no_signal_response(symbol, mode, "스윙 계산 실패")
-
-            current_price = float(ctx["current_price"])
-            levels = ctx["levels"]
-            zone = ctx["zone"]
-            entry_reference = float(zone["preferred_entry"])
-            trades = trade_levels(entry_reference, levels, side)
-
-            vol_ratio = volume_ratio(df_1h["volume"])
-            pump_pct = recent_pump_pct(df_1h["close"], bars=12)
-            level_gap = self._level_gap_pct(df_1h, entry_reference, side)
-            structure = swing_cleanliness(df_1h, swing["start_idx"], swing["end_idx"], side)
-            approx_quote_volume = self._approx_quote_volume_usdt(df_1h)
-
-            quality = score_candidate(
-                divergence=div_1h,
-                zone=zone,
-                volume_ratio_value=vol_ratio,
-                recent_pump=0 if pump_pct <= cfg.max_recent_pump_pct else pump_pct,
-                level_gap_pct=level_gap,
-                rr1=trades["rr1"],
-                structure_score=structure["score"],
-                mode=mode,
-            )
-
-            confirm_30m = None
-            confirm_4h = None
-            prefilter_ok = (
-                div_1h.get("linked") or div_1h.get("regular")
-            ) and structure["score"] >= max(1, cfg.min_structure_score - 1) and approx_quote_volume >= cfg.min_quote_volume_usdt * 0.7
-
-            if prefilter_ok:
-                try:
-                    df_30m = self._prepare(self.service.ohlcv(symbol, "30m", min(180, cfg.lookback_bars)), cfg.rsi_period)
-                    confirm_30m = (
-                        detect_bullish_divergence(df_30m, cfg.pivot_window, cfg.min_pivot_spacing)
-                        if side == "long"
-                        else detect_bearish_divergence(df_30m, cfg.pivot_window, cfg.min_pivot_spacing)
-                    )
-                except Exception:
-                    confirm_30m = None
-
-                if mode == "main" and (zone["in_zone"] or trades["rr1"] >= cfg.min_reward_risk):
-                    try:
-                        df_4h = self._prepare(self.service.ohlcv(symbol, "4h", 160), cfg.rsi_period)
-                        confirm_4h = (
-                            detect_bullish_divergence(df_4h, cfg.pivot_window, cfg.min_pivot_spacing)
-                            if side == "long"
-                            else detect_bearish_divergence(df_4h, cfg.pivot_window, cfg.min_pivot_spacing)
-                        )
-                    except Exception:
-                        confirm_4h = None
-
-            if confirm_30m:
-                quality["score"] += 1
-                quality["reasons"].append("30분봉 재확인")
-            else:
-                quality["warnings"].append("30분봉 재확인 없음")
-                if mode == "main":
-                    quality["downgrade_reasons"].append("30분봉 재확인 없음")
-
-            if confirm_4h and confirm_4h.get("regular"):
-                quality["score"] += 0.5
-                quality["reasons"].append("4시간봉 보조확인")
-
-            stop_abs = abs(trades["stop_pct"])
-            stop_ok = cfg.min_stop_pct <= stop_abs <= cfg.max_stop_pct
-            rr_ok = trades["rr1"] >= cfg.min_reward_risk
-            liquidity_ok = approx_quote_volume >= cfg.min_quote_volume_usdt
-            pump_ok = pump_pct <= cfg.max_recent_pump_pct
-            level_gap_ok = level_gap >= (cfg.resistance_buffer_pct if side == "long" else cfg.support_buffer_pct)
-            structure_ok = structure["score"] >= cfg.min_structure_score
-
-            hard_fail_reasons = list(quality["hard_fail_reasons"])
-            downgrade_reasons = list(dict.fromkeys(quality["downgrade_reasons"]))
-            filter_fail_reasons: List[str] = []
-
-            if not stop_ok:
-                filter_fail_reasons.append("손절폭 기준 이탈")
-            if not rr_ok:
-                filter_fail_reasons.append("손익비 기준 미달")
-            if not liquidity_ok:
-                filter_fail_reasons.append("유동성 기준 미달")
-            if not pump_ok:
-                filter_fail_reasons.append("최근 급등으로 제외")
-            if not level_gap_ok:
-                filter_fail_reasons.append("반대 레벨 여유 부족")
-            if not structure_ok:
-                filter_fail_reasons.append("구조 점수 기준 미달")
-
-            passed = all([
-                quality["passed"],
-                stop_ok,
-                rr_ok,
-                liquidity_ok,
-                pump_ok,
-                level_gap_ok,
-                structure_ok,
-            ])
-
-            status_label = "ready" if zone["in_zone"] else "watch"
-            trade_plan = "즉시 검토" if zone["in_zone"] else "진입구간 대기"
-            state = "candidate" if passed else ("watch" if status_label == "watch" else "filtered")
-            overall_status = "ok"
-            message = "조건 충족" if passed else ("현재 조건 미충족" if filter_fail_reasons or downgrade_reasons else "관찰 후보")
-
+            return _precise_symbol(symbol, mode=mode, svc=self.svc)
+        except Exception as e:
             return {
-                "status": overall_status,
-                "symbol": symbol,
+                "symbol": symbol.replace("/", ""),
                 "mode": mode,
-                "side": side,
-                "status_label": status_label,
-                "state": state,
-                "trade_plan": trade_plan,
-                "passed": passed,
-                "score": round(float(quality["score"]), 2),
-                "message": message,
-                "current_price": round(current_price, 6),
-                "entry_reference_price": round(entry_reference, 6),
-                "entry_zone": {
-                    "lower": round(zone["zone_lower"], 6),
-                    "upper": round(zone["zone_upper"], 6),
-                    "mid": round(zone["zone_mid"], 6),
-                    "distance_to_zone_pct": round(zone["distance_to_zone_pct"], 2),
-                    "in_zone": zone["in_zone"],
-                },
-                "risk": {
-                    "stop_price": round(trades["stop_price"], 6),
-                    "stop_pct": round(trades["stop_pct"], 2),
-                    "tp1_price": round(trades["tp1_price"], 6),
-                    "tp1_pct": round(trades["tp1_pct"], 2),
-                    "tp2_price": round(trades["tp2_price"], 6),
-                    "tp2_pct": round(trades["tp2_pct"], 2),
-                    "tp3_price": round(trades["tp3_price"], 6),
-                    "tp3_pct": round(trades["tp3_pct"], 2),
-                    "rr1": round(trades["rr1"], 2),
-                    "rr2": round(trades["rr2"], 2),
-                    "rr3": round(trades["rr3"], 2),
-                },
-                "signal": {
-                    "linked_divergence": div_1h.get("linked", False),
-                    "regular_divergence": div_1h.get("regular", False),
-                    "rsi_at_trigger": round(div_1h.get("rsi_at_trigger", 0.0), 2),
-                    "divergence_strength": div_1h.get("strength", 0.0),
-                    "pivot_spacing_score": div_1h.get("spacing_score", 0),
-                    "confirm_30m": bool(confirm_30m),
-                    "confirm_4h": bool(confirm_4h),
-                },
-                "market_context": {
-                    "volume_ratio": round(vol_ratio, 3),
-                    "recent_pump_pct": round(pump_pct, 2),
-                    "level_gap_pct": round(level_gap, 2),
-                    "quote_volume_usdt": round(float(approx_quote_volume), 2),
-                    "structure_score": structure["score"],
-                    "structure_noise_ratio": structure["noise_ratio"],
-                    "structure_bars": structure["bars"],
-                },
-                "reasons": quality["reasons"],
-                "warnings": quality["warnings"],
-                "rejected_by": filter_fail_reasons + hard_fail_reasons,
-                "downgraded_by": downgrade_reasons,
-                "errors": [],
-                "filters": {
-                    "stop_ok": stop_ok,
-                    "rr_ok": rr_ok,
-                    "liquidity_ok": liquidity_ok,
-                    "pump_ok": pump_ok,
-                    "level_gap_ok": level_gap_ok,
-                    "structure_ok": structure_ok,
-                },
-                "fib_levels": {k: round(v, 6) for k, v in levels.items()},
+                "passed": False,
+                "state": "reject",
+                "direction": "neutral",
+                "score": 0.0,
+                "message": f"심볼 분석 실패: {e}",
+                "warnings": [],
+                "reasons": [],
+                "rejected_by": [],
+                "downgraded_by": [],
             }
-        except Exception as exc:  # pragma: no cover
-            return self._build_symbol_error(symbol, mode, exc)
 
     def scan(self, mode: str = "main", limit: int = 10) -> Dict:
-        cfg = ScanConfig(mode=mode)
-        started_at = time.monotonic()
-        symbols = self.service.candidate_symbols(mode=mode, limit=cfg.candidate_pool)
-        candidates: List[Dict] = []
+        profile = self._profile(mode)
+        started = time.time()
         errors: List[str] = []
-        analyzed = 0
-        stopped_reason = "completed"
+        stopped_reason = None
 
-        for symbol in symbols:
-            elapsed = time.monotonic() - started_at
-            if analyzed >= cfg.max_processed_symbols:
-                stopped_reason = "max_processed_symbols"
-                break
-            if elapsed >= cfg.max_scan_seconds:
-                stopped_reason = "time_budget_exceeded"
-                break
-
-            result = self.analyze_symbol(symbol, mode=mode)
-            analyzed += 1
-            if result.get("errors"):
-                errors.extend(result["errors"])
-            if result.get("passed"):
-                candidates.append(result)
-
-        candidates.sort(
-            key=lambda x: (
-                x.get("status_label") == "ready",
-                x.get("score", 0),
-                x.get("risk", {}).get("rr1", 0),
-                x.get("risk", {}).get("tp1_pct", 0),
-            ),
-            reverse=True,
+        universe = self.svc.fetch_dynamic_universe(
+            pool_size=profile.pool_size,
+            min_quote_volume=profile.min_quote_volume
         )
-        items = candidates[:limit]
 
-        status = "partial" if errors or stopped_reason != "completed" else "ok"
-        if items:
-            message = f"{mode} 조건 충족 종목 {len(items)}개"
-        else:
-            message = f"현재 {mode} 조건을 만족하는 종목이 없습니다."
+        stage1 = []
+        for idx, symbol in enumerate(universe, start=1):
+            if time.time() - started > profile.time_budget_sec * 0.45:
+                stopped_reason = "stage1_time_budget_exceeded"
+                break
+            if len(stage1) >= profile.stage1_limit:
+                stopped_reason = stopped_reason or "stage1_limit_reached"
+                break
+            try:
+                s1 = _stage1_quick_symbol(symbol, self.svc, profile)
+                if s1["passed"]:
+                    stage1.append(s1)
+            except Exception as e:
+                errors.append(f"{symbol}: {type(e).__name__}: {e}")
+
+        stage1.sort(key=lambda x: (x["stage1_score"], x["quote_volume_24h_est"]), reverse=True)
+        shortlisted = stage1[: profile.stage2_limit]
+
+        items = []
+        for s1 in shortlisted:
+            if time.time() - started > profile.time_budget_sec:
+                stopped_reason = stopped_reason or "time_budget_exceeded"
+                break
+            try:
+                item = _precise_symbol(s1["symbol_ccxt"], mode=mode, svc=self.svc)
+                # carry forward quick reasons
+                item["warnings"] = list(dict.fromkeys(item["warnings"] + s1["warnings"]))
+                if item["passed"] or (profile.allow_watch and item["state"] == "watch"):
+                    items.append(item)
+            except Exception as e:
+                errors.append(f"{s1['symbol']}: {type(e).__name__}: {e}")
+
+        items.sort(key=lambda x: (x["state"] == "ready", x["score"], x.get("rr1") or 0), reverse=True)
+        items = items[:limit]
+
+        status = "partial" if errors or stopped_reason else "ok"
+        msg = (
+            f"현재 {mode} 조건을 만족하는 종목이 없습니다."
+            if not items
+            else f"현재 {mode} 후보 {len(items)}개 포착"
+        )
         if stopped_reason == "time_budget_exceeded":
-            message += " 빠른 응답을 위해 시간 예산 내에서 스캔을 중단했습니다."
-        elif stopped_reason == "max_processed_symbols":
-            message += " 안정성을 위해 최대 스캔 심볼 수에서 중단했습니다."
+            msg += " 빠른 응답을 위해 시간 예산 내에서 스캔을 중단했습니다."
+        elif stopped_reason and stopped_reason.startswith("stage1_"):
+            msg += " 전체 후보군 선별 중 제한에 도달했습니다."
 
         return {
             "status": status,
             "mode": mode,
             "count": len(items),
-            "candidate_pool": len(symbols),
-            "scanned": analyzed,
+            "candidate_pool": len(universe),
+            "stage1_checked": min(len(universe), len(stage1) + len(errors)),
+            "stage2_checked": len(shortlisted),
+            "scan_seconds": round(time.time() - started, 2),
             "stopped_reason": stopped_reason,
-            "scan_seconds": round(time.monotonic() - started_at, 2),
             "items": items,
-            "message": message,
+            "message": msg,
             "errors": errors[:20],
         }

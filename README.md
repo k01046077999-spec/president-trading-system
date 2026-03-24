@@ -1,24 +1,20 @@
-# 대통령매매법 v1.4
+# 대통령매매법 코인 검색기 v1.5
 
-이번 버전은 고정 심볼 화이트리스트를 제거하고, **Binance USDT 현물 시장의 최근 거래대금 상위 심볼을 동적으로 불러온 뒤** 대통령매매법 조건을 적용합니다.
+이번 버전은 **전체선별 -> 후보 정밀판정** 구조다.
 
-핵심 변경점:
-- 메인/서브 모두 거래대금 상위 코인을 **동적으로 모집단 구성**
-- 전체 코인 완전탐색 대신 **시간 예산 + 최대 처리 심볼 수** 기준으로 안전하게 중단
-- 1시간봉 선필터 후 30분/4시간을 확인하는 구조 유지
-- 0건일 때도 정상 JSON 반환
-- 일부 심볼 실패 시 전체 스캔 유지
+## 핵심 변경점
+- 거래대금 상위 코인 동적 유니버스 확보
+- 1차 선별: 1시간봉 기반의 가벼운 필터로 넓게 훑기
+- 2차 판정: shortlisted 후보만 30분봉/4시간봉/Fib/손익비 정밀 체크
+- 전체 시장을 보되 서버가 죽지 않도록 시간 예산/단계별 제한을 병행
+- OpenAPI 스키마 명시형 유지
 
-기본 안전장치:
-- main: 후보군 120개, 최대 처리 36개, 최대 스캔 시간 14초
-- sub: 후보군 180개, 최대 처리 72개, 최대 스캔 시간 24초
+## 엔드포인트
+- `/health`
+- `/scan/main`
+- `/scan/sub`
+- `/scan/symbol/{symbol}?mode=main`
 
-주의:
-- Render free 환경에서는 시장 상태와 네트워크에 따라 실제 처리 개수는 변동됩니다.
-- 더 넓게 보려면 `core/config.py`에서 `candidate_pool_*`, `max_processed_symbols_*`, `max_scan_seconds_*`를 조절하면 됩니다.
-
-
-## v1.4.1
-- FastAPI response_model 추가
-- OpenAPI 스키마 명시화
-- GPT Actions용 health/scan 응답 구조 고정
+## GPT 연결용
+OpenAPI URL:
+`https://president-trading-system-1.onrender.com/openapi.json`

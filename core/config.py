@@ -1,89 +1,54 @@
-from pydantic import BaseModel
+from dataclasses import dataclass, field
+from typing import List
 
+EXCLUDED_KEYWORDS = ("UP", "DOWN", "BULL", "BEAR", "USD_", "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "PAXG")
+EXCLUDED_EXACT = {
+    "USDC/USDT", "FDUSD/USDT", "TUSD/USDT", "BUSD/USDT", "DAI/USDT", "USDP/USDT",
+    "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "DAIUSDT", "USDPUSDT"
+}
 
-class ScanConfig(BaseModel):
-    mode: str = "main"
-    limit: int = 10
-    pivot_window: int = 3
-    rsi_period: int = 14
-    lookback_bars: int = 220
-    min_quote_volume_usdt_main: float = 8_000_000
-    min_quote_volume_usdt_sub: float = 2_500_000
-    max_recent_pump_pct_main: float = 15.0
-    max_recent_pump_pct_sub: float = 20.0
-    min_reward_risk_main: float = 1.5
-    min_reward_risk_sub: float = 1.0
-    fib_zone_main_low: float = 0.618
-    fib_zone_main_high: float = 0.786
-    fib_zone_sub_low: float = 0.55
-    fib_zone_sub_high: float = 0.82
-    structure_lookback_bars: int = 70
-    resistance_buffer_pct_main: float = 2.5
-    resistance_buffer_pct_sub: float = 1.8
-    support_buffer_pct_main: float = 2.5
-    support_buffer_pct_sub: float = 1.8
-    max_stop_pct_main: float = 10.0
-    max_stop_pct_sub: float = 14.0
-    min_stop_pct_main: float = 1.5
-    min_stop_pct_sub: float = 0.8
-    min_pivot_spacing: int = 4
-    min_structure_score_main: float = 2.0
-    min_structure_score_sub: float = 1.0
-    candidate_pool_main: int = 120
-    candidate_pool_sub: int = 180
-    max_scan_seconds_main: float = 14.0
-    max_scan_seconds_sub: float = 24.0
-    max_processed_symbols_main: int = 36
-    max_processed_symbols_sub: int = 72
+@dataclass
+class ScanProfile:
+    mode: str
+    pool_size: int
+    stage1_limit: int
+    stage2_limit: int
+    time_budget_sec: float
+    result_limit: int
+    min_quote_volume: float
+    stage1_rsi_low: float
+    stage1_rsi_high: float
+    stage1_score_min: float
+    final_score_min: float
+    allow_watch: bool = True
 
-    @property
-    def min_reward_risk(self) -> float:
-        return self.min_reward_risk_main if self.mode == "main" else self.min_reward_risk_sub
+MAIN_PROFILE = ScanProfile(
+    mode="main",
+    pool_size=260,
+    stage1_limit=80,
+    stage2_limit=24,
+    time_budget_sec=22.0,
+    result_limit=10,
+    min_quote_volume=3_000_000,
+    stage1_rsi_low=22.0,
+    stage1_rsi_high=58.0,
+    stage1_score_min=2.0,
+    final_score_min=6.0,
+)
 
-    @property
-    def max_stop_pct(self) -> float:
-        return self.max_stop_pct_main if self.mode == "main" else self.max_stop_pct_sub
+SUB_PROFILE = ScanProfile(
+    mode="sub",
+    pool_size=360,
+    stage1_limit=140,
+    stage2_limit=48,
+    time_budget_sec=32.0,
+    result_limit=14,
+    min_quote_volume=1_500_000,
+    stage1_rsi_low=18.0,
+    stage1_rsi_high=65.0,
+    stage1_score_min=1.0,
+    final_score_min=4.0,
+)
 
-    @property
-    def min_stop_pct(self) -> float:
-        return self.min_stop_pct_main if self.mode == "main" else self.min_stop_pct_sub
-
-    @property
-    def fib_zone_low(self) -> float:
-        return self.fib_zone_main_low if self.mode == "main" else self.fib_zone_sub_low
-
-    @property
-    def fib_zone_high(self) -> float:
-        return self.fib_zone_main_high if self.mode == "main" else self.fib_zone_sub_high
-
-    @property
-    def min_structure_score(self) -> float:
-        return self.min_structure_score_main if self.mode == "main" else self.min_structure_score_sub
-
-    @property
-    def candidate_pool(self) -> int:
-        return self.candidate_pool_main if self.mode == "main" else self.candidate_pool_sub
-
-    @property
-    def max_scan_seconds(self) -> float:
-        return self.max_scan_seconds_main if self.mode == "main" else self.max_scan_seconds_sub
-
-    @property
-    def max_processed_symbols(self) -> int:
-        return self.max_processed_symbols_main if self.mode == "main" else self.max_processed_symbols_sub
-
-    @property
-    def min_quote_volume_usdt(self) -> float:
-        return self.min_quote_volume_usdt_main if self.mode == "main" else self.min_quote_volume_usdt_sub
-
-    @property
-    def max_recent_pump_pct(self) -> float:
-        return self.max_recent_pump_pct_main if self.mode == "main" else self.max_recent_pump_pct_sub
-
-    @property
-    def resistance_buffer_pct(self) -> float:
-        return self.resistance_buffer_pct_main if self.mode == "main" else self.resistance_buffer_pct_sub
-
-    @property
-    def support_buffer_pct(self) -> float:
-        return self.support_buffer_pct_main if self.mode == "main" else self.support_buffer_pct_sub
+BASE_URL = "https://president-trading-system-1.onrender.com"
+APP_VERSION = "1.5.0"
