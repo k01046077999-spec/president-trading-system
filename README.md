@@ -16,3 +16,9 @@
 주의:
 - Render free 환경에서는 시장 상태와 네트워크에 따라 실제 처리 개수는 변동됩니다.
 - 더 넓게 보려면 `core/config.py`에서 `candidate_pool_*`, `max_processed_symbols_*`, `max_scan_seconds_*`를 조절하면 됩니다.
+
+
+## v1.4.1
+- FastAPI response_model 추가
+- OpenAPI 스키마 명시화
+- GPT Actions용 health/scan 응답 구조 고정
