@@ -4,4 +4,5 @@ pydantic>=2
 pandas
 numpy
 ccxt
+ta
 python-dotenv

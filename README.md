@@ -1,20 +1,28 @@
-# 대통령매매법 코인 검색기 v1.5
+# 대통령매매법 코인 검색기 v1.6
 
-이번 버전은 **전체선별 -> 후보 정밀판정** 구조다.
+## 핵심 구조
+- 요청 시 풀스캔하지 않음
+- 백그라운드에서 main/sub 결과를 주기적으로 갱신
+- API는 최신 캐시 스냅샷만 즉시 반환
+- GPT는 `/gpt/main`, `/gpt/sub` 사용 권장
 
-## 핵심 변경점
-- 거래대금 상위 코인 동적 유니버스 확보
-- 1차 선별: 1시간봉 기반의 가벼운 필터로 넓게 훑기
-- 2차 판정: shortlisted 후보만 30분봉/4시간봉/Fib/손익비 정밀 체크
-- 전체 시장을 보되 서버가 죽지 않도록 시간 예산/단계별 제한을 병행
-- OpenAPI 스키마 명시형 유지
+## 장점
+- 요청 시 timeout/502 가능성 감소
+- 전체 선별 -> 후보 정밀판정 구조 유지
+- 무거운 분석과 빠른 응답 분리
 
 ## 엔드포인트
-- `/health`
-- `/scan/main`
-- `/scan/sub`
-- `/scan/symbol/{symbol}?mode=main`
+- `GET /health`
+- `GET /scan/main`
+- `GET /scan/sub`
+- `GET /gpt/main`
+- `GET /gpt/sub`
+- `GET /scan/symbol/{symbol}?mode=main`
+- `POST /refresh/main`
+- `POST /refresh/sub`
 
-## GPT 연결용
-OpenAPI URL:
-`https://president-trading-system-1.onrender.com/openapi.json`
+## 응답 해석
+- `status=ok` 정상
+- `status=partial` 일부 심볼 오류가 있었지만 결과 사용 가능
+- `status=refreshing` 초기 스캔 또는 캐시 갱신 대기
+- `cache_status=fresh|stale|empty`
