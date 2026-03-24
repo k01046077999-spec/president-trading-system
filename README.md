@@ -1,34 +1,18 @@
-# 대통령매매법 코인 검색기 v1.3 경량화판
+# 대통령매매법 v1.4
 
-이번 버전은 **Render free/Starter에서 빠르게 응답하도록 경량화**한 운영판이다.
+이번 버전은 고정 심볼 화이트리스트를 제거하고, **Binance USDT 현물 시장의 최근 거래대금 상위 심볼을 동적으로 불러온 뒤** 대통령매매법 조건을 적용합니다.
 
-## 핵심 변경
-- 메인/서브 모두 **전체 코인 완전탐색 제거**
-- 메인: 상위 유동성 12개만 스캔
-- 서브: 상위 유동성 24개만 스캔
-- 전 종목 3타임프레임 동시 조회 제거
-- **1시간봉 선필터 통과 종목만** 30분/4시간 추가 확인
-- `ticker()` 제거, 최근 24개 1시간봉 기준 **근사 quote volume** 사용
-- 심볼별 실패는 skip하고 `errors`에만 기록
-- 0건일 때도 항상 정상 JSON 반환
+핵심 변경점:
+- 메인/서브 모두 거래대금 상위 코인을 **동적으로 모집단 구성**
+- 전체 코인 완전탐색 대신 **시간 예산 + 최대 처리 심볼 수** 기준으로 안전하게 중단
+- 1시간봉 선필터 후 30분/4시간을 확인하는 구조 유지
+- 0건일 때도 정상 JSON 반환
+- 일부 심볼 실패 시 전체 스캔 유지
 
-## API
-- `GET /health`
-- `GET /scan/main`
-- `GET /scan/sub`
-- `GET /scan/symbol/{symbol}?mode=main`
+기본 안전장치:
+- main: 후보군 120개, 최대 처리 36개, 최대 스캔 시간 14초
+- sub: 후보군 180개, 최대 처리 72개, 최대 스캔 시간 24초
 
-## 실행
-```bash
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-## Render
-- Build command: `pip install -r requirements.txt`
-- Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-
-## 기대 효과
-- `/scan/main`, `/scan/sub` 502/500 빈도 감소
-- GPT Action 호출 안정성 향상
-- 메인은 빠른 응답 우선, 서브는 약간 넓은 탐색
+주의:
+- Render free 환경에서는 시장 상태와 네트워크에 따라 실제 처리 개수는 변동됩니다.
+- 더 넓게 보려면 `core/config.py`에서 `candidate_pool_*`, `max_processed_symbols_*`, `max_scan_seconds_*`를 조절하면 됩니다.

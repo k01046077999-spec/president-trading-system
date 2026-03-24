@@ -29,8 +29,12 @@ class ScanConfig(BaseModel):
     min_pivot_spacing: int = 4
     min_structure_score_main: float = 2.0
     min_structure_score_sub: float = 1.0
-    max_scan_symbols_main: int = 12
-    max_scan_symbols_sub: int = 24
+    candidate_pool_main: int = 120
+    candidate_pool_sub: int = 180
+    max_scan_seconds_main: float = 14.0
+    max_scan_seconds_sub: float = 24.0
+    max_processed_symbols_main: int = 36
+    max_processed_symbols_sub: int = 72
 
     @property
     def min_reward_risk(self) -> float:
@@ -57,8 +61,16 @@ class ScanConfig(BaseModel):
         return self.min_structure_score_main if self.mode == "main" else self.min_structure_score_sub
 
     @property
-    def max_scan_symbols(self) -> int:
-        return self.max_scan_symbols_main if self.mode == "main" else self.max_scan_symbols_sub
+    def candidate_pool(self) -> int:
+        return self.candidate_pool_main if self.mode == "main" else self.candidate_pool_sub
+
+    @property
+    def max_scan_seconds(self) -> float:
+        return self.max_scan_seconds_main if self.mode == "main" else self.max_scan_seconds_sub
+
+    @property
+    def max_processed_symbols(self) -> int:
+        return self.max_processed_symbols_main if self.mode == "main" else self.max_processed_symbols_sub
 
     @property
     def min_quote_volume_usdt(self) -> float:

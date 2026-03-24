@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -260,12 +261,22 @@ class PresidentTradingEngine:
 
     def scan(self, mode: str = "main", limit: int = 10) -> Dict:
         cfg = ScanConfig(mode=mode)
-        symbols = self.service.candidate_symbols(mode=mode, limit=cfg.max_scan_symbols)
+        started_at = time.monotonic()
+        symbols = self.service.candidate_symbols(mode=mode, limit=cfg.candidate_pool)
         candidates: List[Dict] = []
         errors: List[str] = []
         analyzed = 0
+        stopped_reason = "completed"
 
         for symbol in symbols:
+            elapsed = time.monotonic() - started_at
+            if analyzed >= cfg.max_processed_symbols:
+                stopped_reason = "max_processed_symbols"
+                break
+            if elapsed >= cfg.max_scan_seconds:
+                stopped_reason = "time_budget_exceeded"
+                break
+
             result = self.analyze_symbol(symbol, mode=mode)
             analyzed += 1
             if result.get("errors"):
@@ -284,13 +295,24 @@ class PresidentTradingEngine:
         )
         items = candidates[:limit]
 
-        status = "partial" if errors else "ok"
-        message = f"{mode} 조건 충족 종목 {len(items)}개" if items else f"현재 {mode} 조건을 만족하는 종목이 없습니다."
+        status = "partial" if errors or stopped_reason != "completed" else "ok"
+        if items:
+            message = f"{mode} 조건 충족 종목 {len(items)}개"
+        else:
+            message = f"현재 {mode} 조건을 만족하는 종목이 없습니다."
+        if stopped_reason == "time_budget_exceeded":
+            message += " 빠른 응답을 위해 시간 예산 내에서 스캔을 중단했습니다."
+        elif stopped_reason == "max_processed_symbols":
+            message += " 안정성을 위해 최대 스캔 심볼 수에서 중단했습니다."
+
         return {
             "status": status,
             "mode": mode,
             "count": len(items),
+            "candidate_pool": len(symbols),
             "scanned": analyzed,
+            "stopped_reason": stopped_reason,
+            "scan_seconds": round(time.monotonic() - started_at, 2),
             "items": items,
             "message": message,
             "errors": errors[:20],
