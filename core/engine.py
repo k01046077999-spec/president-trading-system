@@ -22,8 +22,14 @@ class PresidentTradingEngine:
         out["rsi"] = rsi(out["close"], period=rsi_period)
         return out
 
+    def _approx_quote_volume_usdt(self, df: pd.DataFrame, bars: int = 24) -> float:
+        if df.empty:
+            return 0.0
+        seg = df.tail(bars)
+        return float((seg["close"] * seg["volume"]).sum())
+
     def _level_gap_pct(self, df: pd.DataFrame, reference_price: float, side: str) -> float:
-        lookback = df.tail(60)
+        lookback = df.tail(50)
         if lookback.empty or reference_price <= 0:
             return 0.0
         if side == "long":
@@ -56,36 +62,32 @@ class PresidentTradingEngine:
             "errors": [f"{symbol}: {type(exc).__name__}: {str(exc)}"],
         }
 
+    def _load_1h_context(self, symbol: str, cfg: ScanConfig):
+        df_1h = self._prepare(self.service.ohlcv(symbol, "1h", cfg.lookback_bars), cfg.rsi_period)
+        div_1h = best_divergence(df_1h, pivot_window=cfg.pivot_window, min_spacing=cfg.min_pivot_spacing)
+        if not div_1h:
+            return df_1h, None, None, None, None
+        side = div_1h["side"]
+        swing = build_swing_from_divergence(div_1h, df_1h, structure_lookback_bars=cfg.structure_lookback_bars)
+        if not swing:
+            return df_1h, div_1h, side, None, None
+        current_price = float(df_1h["close"].iloc[-1])
+        levels = build_fib_levels(swing["swing_low"], swing["swing_high"], side=side)
+        zone = fib_zone_status(current_price, levels, cfg.fib_zone_low, cfg.fib_zone_high, side)
+        return df_1h, div_1h, side, swing, {"levels": levels, "zone": zone, "current_price": current_price}
+
     def analyze_symbol(self, symbol: str, mode: str = "main") -> Dict:
         try:
             cfg = ScanConfig(mode=mode)
-            df_1h = self._prepare(self.service.ohlcv(symbol, "1h", cfg.lookback_bars), cfg.rsi_period)
-            df_30m = self._prepare(self.service.ohlcv(symbol, "30m", cfg.lookback_bars), cfg.rsi_period)
-            df_4h = self._prepare(self.service.ohlcv(symbol, "4h", cfg.lookback_bars), cfg.rsi_period)
-
-            div_1h = best_divergence(df_1h, pivot_window=cfg.pivot_window, min_spacing=cfg.min_pivot_spacing)
+            df_1h, div_1h, side, swing, ctx = self._load_1h_context(symbol, cfg)
             if not div_1h:
                 return self._build_no_signal_response(symbol, mode, "1시간봉 유효 다이버전스 없음")
-
-            side = div_1h["side"]
-            confirm_30m = (
-                detect_bullish_divergence(df_30m, cfg.pivot_window, cfg.min_pivot_spacing)
-                if side == "long"
-                else detect_bearish_divergence(df_30m, cfg.pivot_window, cfg.min_pivot_spacing)
-            )
-            confirm_4h = (
-                detect_bullish_divergence(df_4h, cfg.pivot_window, cfg.min_pivot_spacing)
-                if side == "long"
-                else detect_bearish_divergence(df_4h, cfg.pivot_window, cfg.min_pivot_spacing)
-            )
-
-            swing = build_swing_from_divergence(div_1h, df_1h, structure_lookback_bars=cfg.structure_lookback_bars)
-            if not swing:
+            if not swing or not ctx:
                 return self._build_no_signal_response(symbol, mode, "스윙 계산 실패")
 
-            current_price = float(df_1h["close"].iloc[-1])
-            levels = build_fib_levels(swing["swing_low"], swing["swing_high"], side=side)
-            zone = fib_zone_status(current_price, levels, cfg.fib_zone_low, cfg.fib_zone_high, side)
+            current_price = float(ctx["current_price"])
+            levels = ctx["levels"]
+            zone = ctx["zone"]
             entry_reference = float(zone["preferred_entry"])
             trades = trade_levels(entry_reference, levels, side)
 
@@ -93,6 +95,7 @@ class PresidentTradingEngine:
             pump_pct = recent_pump_pct(df_1h["close"], bars=12)
             level_gap = self._level_gap_pct(df_1h, entry_reference, side)
             structure = swing_cleanliness(df_1h, swing["start_idx"], swing["end_idx"], side)
+            approx_quote_volume = self._approx_quote_volume_usdt(df_1h)
 
             quality = score_candidate(
                 divergence=div_1h,
@@ -105,6 +108,34 @@ class PresidentTradingEngine:
                 mode=mode,
             )
 
+            confirm_30m = None
+            confirm_4h = None
+            prefilter_ok = (
+                div_1h.get("linked") or div_1h.get("regular")
+            ) and structure["score"] >= max(1, cfg.min_structure_score - 1) and approx_quote_volume >= cfg.min_quote_volume_usdt * 0.7
+
+            if prefilter_ok:
+                try:
+                    df_30m = self._prepare(self.service.ohlcv(symbol, "30m", min(180, cfg.lookback_bars)), cfg.rsi_period)
+                    confirm_30m = (
+                        detect_bullish_divergence(df_30m, cfg.pivot_window, cfg.min_pivot_spacing)
+                        if side == "long"
+                        else detect_bearish_divergence(df_30m, cfg.pivot_window, cfg.min_pivot_spacing)
+                    )
+                except Exception:
+                    confirm_30m = None
+
+                if mode == "main" and (zone["in_zone"] or trades["rr1"] >= cfg.min_reward_risk):
+                    try:
+                        df_4h = self._prepare(self.service.ohlcv(symbol, "4h", 160), cfg.rsi_period)
+                        confirm_4h = (
+                            detect_bullish_divergence(df_4h, cfg.pivot_window, cfg.min_pivot_spacing)
+                            if side == "long"
+                            else detect_bearish_divergence(df_4h, cfg.pivot_window, cfg.min_pivot_spacing)
+                        )
+                    except Exception:
+                        confirm_4h = None
+
             if confirm_30m:
                 quality["score"] += 1
                 quality["reasons"].append("30분봉 재확인")
@@ -114,20 +145,19 @@ class PresidentTradingEngine:
                     quality["downgrade_reasons"].append("30분봉 재확인 없음")
 
             if confirm_4h and confirm_4h.get("regular"):
-                quality["score"] += 1
+                quality["score"] += 0.5
                 quality["reasons"].append("4시간봉 보조확인")
 
-            ticker = self.service.ticker(symbol)
             stop_abs = abs(trades["stop_pct"])
             stop_ok = cfg.min_stop_pct <= stop_abs <= cfg.max_stop_pct
             rr_ok = trades["rr1"] >= cfg.min_reward_risk
-            liquidity_ok = ticker.get("quoteVolume", 0) >= cfg.min_quote_volume_usdt
+            liquidity_ok = approx_quote_volume >= cfg.min_quote_volume_usdt
             pump_ok = pump_pct <= cfg.max_recent_pump_pct
             level_gap_ok = level_gap >= (cfg.resistance_buffer_pct if side == "long" else cfg.support_buffer_pct)
             structure_ok = structure["score"] >= cfg.min_structure_score
 
             hard_fail_reasons = list(quality["hard_fail_reasons"])
-            downgrade_reasons = list(quality["downgrade_reasons"])
+            downgrade_reasons = list(dict.fromkeys(quality["downgrade_reasons"]))
             filter_fail_reasons: List[str] = []
 
             if not stop_ok:
@@ -153,9 +183,9 @@ class PresidentTradingEngine:
                 structure_ok,
             ])
 
-            status = "ready" if zone["in_zone"] else "watch"
+            status_label = "ready" if zone["in_zone"] else "watch"
             trade_plan = "즉시 검토" if zone["in_zone"] else "진입구간 대기"
-            state = "candidate" if passed else ("watch" if status == "watch" else "filtered")
+            state = "candidate" if passed else ("watch" if status_label == "watch" else "filtered")
             overall_status = "ok"
             message = "조건 충족" if passed else ("현재 조건 미충족" if filter_fail_reasons or downgrade_reasons else "관찰 후보")
 
@@ -164,7 +194,7 @@ class PresidentTradingEngine:
                 "symbol": symbol,
                 "mode": mode,
                 "side": side,
-                "status_label": status,
+                "status_label": status_label,
                 "state": state,
                 "trade_plan": trade_plan,
                 "passed": passed,
@@ -205,7 +235,7 @@ class PresidentTradingEngine:
                     "volume_ratio": round(vol_ratio, 3),
                     "recent_pump_pct": round(pump_pct, 2),
                     "level_gap_pct": round(level_gap, 2),
-                    "quote_volume_usdt": round(float(ticker.get("quoteVolume", 0) or 0), 2),
+                    "quote_volume_usdt": round(float(approx_quote_volume), 2),
                     "structure_score": structure["score"],
                     "structure_noise_ratio": structure["noise_ratio"],
                     "structure_bars": structure["bars"],
@@ -228,9 +258,9 @@ class PresidentTradingEngine:
         except Exception as exc:  # pragma: no cover
             return self._build_symbol_error(symbol, mode, exc)
 
-    def scan(self, mode: str = "main", limit: int = 15) -> Dict:
+    def scan(self, mode: str = "main", limit: int = 10) -> Dict:
         cfg = ScanConfig(mode=mode)
-        symbols = self.service.usdt_symbols(limit=cfg.max_scan_symbols)
+        symbols = self.service.candidate_symbols(mode=mode, limit=cfg.max_scan_symbols)
         candidates: List[Dict] = []
         errors: List[str] = []
         analyzed = 0
@@ -254,13 +284,8 @@ class PresidentTradingEngine:
         )
         items = candidates[:limit]
 
-        if items:
-            status = "partial" if errors else "ok"
-            message = f"{mode} 조건 충족 종목 {len(items)}개"
-        else:
-            status = "partial" if errors else "ok"
-            message = f"현재 {mode} 조건을 만족하는 종목이 없습니다."
-
+        status = "partial" if errors else "ok"
+        message = f"{mode} 조건 충족 종목 {len(items)}개" if items else f"현재 {mode} 조건을 만족하는 종목이 없습니다."
         return {
             "status": status,
             "mode": mode,

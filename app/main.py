@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse
 
 from core.engine import PresidentTradingEngine
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 BASE_URL = "https://president-trading-system-1.onrender.com"
 
 app = FastAPI(
@@ -22,14 +22,14 @@ def health() -> dict:
 
 
 @app.get("/scan/main")
-def scan_main(limit: int = Query(default=10, ge=1, le=50)) -> JSONResponse:
+def scan_main(limit: int = Query(default=8, ge=1, le=20)) -> JSONResponse:
     result = engine.scan(mode="main", limit=limit)
     code = 200 if result["status"] in {"ok", "partial"} else 500
     return JSONResponse(content=result, status_code=code)
 
 
 @app.get("/scan/sub")
-def scan_sub(limit: int = Query(default=10, ge=1, le=50)) -> JSONResponse:
+def scan_sub(limit: int = Query(default=12, ge=1, le=30)) -> JSONResponse:
     result = engine.scan(mode="sub", limit=limit)
     code = 200 if result["status"] in {"ok", "partial"} else 500
     return JSONResponse(content=result, status_code=code)
