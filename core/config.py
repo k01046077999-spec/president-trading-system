@@ -23,8 +23,10 @@ class ScanConfig(BaseModel):
     min_stop_pct_main: float = 1.5
     min_stop_pct_sub: float = 1.0
     min_pivot_spacing: int = 4
-    min_structure_score_main: int = 2
-    min_structure_score_sub: int = 1
+    min_structure_score_main: float = 2.0
+    min_structure_score_sub: float = 1.0
+    max_scan_symbols_main: int = 40
+    max_scan_symbols_sub: int = 60
 
     @property
     def min_reward_risk(self) -> float:
@@ -47,5 +49,9 @@ class ScanConfig(BaseModel):
         return self.fib_zone_main_high if self.mode == "main" else self.fib_zone_sub_high
 
     @property
-    def min_structure_score(self) -> int:
+    def min_structure_score(self) -> float:
         return self.min_structure_score_main if self.mode == "main" else self.min_structure_score_sub
+
+    @property
+    def max_scan_symbols(self) -> int:
+        return self.max_scan_symbols_main if self.mode == "main" else self.max_scan_symbols_sub

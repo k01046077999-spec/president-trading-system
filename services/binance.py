@@ -8,10 +8,16 @@ import pandas as pd
 
 class BinanceService:
     def __init__(self) -> None:
-        self.exchange = ccxt.binance({"enableRateLimit": True})
+        self.exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        self._markets = None
+
+    def _load_markets(self):
+        if self._markets is None:
+            self._markets = self.exchange.load_markets()
+        return self._markets
 
     def usdt_symbols(self, limit: int = 60) -> List[str]:
-        markets = self.exchange.load_markets()
+        markets = self._load_markets()
         symbols = []
         for symbol, market in markets.items():
             if not market.get("spot"):
@@ -26,6 +32,8 @@ class BinanceService:
     def ohlcv(self, symbol: str, timeframe: str = "1h", limit: int = 220) -> pd.DataFrame:
         market_symbol = symbol if "/" in symbol else f"{symbol[:-4]}/USDT" if symbol.endswith("USDT") else symbol
         rows = self.exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
+        if not rows:
+            raise ValueError(f"OHLCV 없음: {market_symbol} {timeframe}")
         df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         return df
