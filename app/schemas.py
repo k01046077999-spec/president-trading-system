@@ -1,47 +1,39 @@
-from __future__ import annotations
-
-from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
+from typing import Literal
 
 
 class HealthResponse(BaseModel):
-    status: str = "ok"
-    system: str = "president-trading-system"
+    status: str
+    system: str
     version: str
 
 
 class ScanItem(BaseModel):
+    passed: bool = False
     symbol: str
-    state: Literal["ready", "watch", "rejected"] = "watch"
-    direction: Literal["long", "short", "neutral"] = "long"
-    stop_pct: Optional[float] = None
-    tp1_pct: Optional[float] = None
-    tp2_pct: Optional[float] = None
-    rr1: Optional[float] = None
-    rr2: Optional[float] = None
-    score: float = 0.0
-    reason_summary: str = ""
-    warnings: List[str] = Field(default_factory=list)
-    rejected_by: List[str] = Field(default_factory=list)
-    downgraded_by: List[str] = Field(default_factory=list)
+    state: Literal["ready", "watch"] = "watch"
+    direction: str | None = None
+    stop_pct: float | None = None
+    tp1_pct: float | None = None
+    tp2_pct: float | None = None
+    rr: float | None = None
+    message: str = ""
+    warnings: list[str] = Field(default_factory=list)
+    rejected_by: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    reason_summary: str | None = None
 
 
 class ScanResponse(BaseModel):
-    status: Literal["ok", "partial", "refreshing", "error"]
-    mode: Literal["main", "sub"]
-    count: int
+    status: str
+    mode: str
+    count: int = 0
     candidate_pool: int = 0
     stage1_checked: int = 0
     stage2_checked: int = 0
-    refreshed_at: Optional[str] = None
-    age_seconds: Optional[float] = None
-    cache_status: Optional[Literal["fresh", "stale", "empty"]] = None
-    items: List[ScanItem] = Field(default_factory=list)
-    message: str
-    errors: List[str] = Field(default_factory=list)
-
-
-class RefreshResponse(BaseModel):
-    status: str
-    mode: Literal["main", "sub"]
-    message: str
+    scan_seconds: float = 0.0
+    stopped_reason: str | None = None
+    items: list[ScanItem] = Field(default_factory=list)
+    message: str = ""
+    errors: list[str] = Field(default_factory=list)
+    cache_status: str | None = None

@@ -1,33 +1,19 @@
-from __future__ import annotations
-
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-from threading import Lock
-from typing import Any, Dict, Optional
+from threading import RLock
+from typing import Any
 
 
-class CacheStore:
-    def __init__(self, path: str = "data/cache.json") -> None:
-        self.path = Path(path)
-        self.lock = Lock()
-        self.data: Dict[str, Any] = {"main": None, "sub": None}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            except Exception:
-                self.data = {"main": None, "sub": None}
+class InMemoryCache:
+    def __init__(self) -> None:
+        self._data: dict[str, dict[str, Any]] = {}
+        self._lock = RLock()
 
-    def get(self, mode: str) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            return self.data.get(mode)
+    def get(self, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            value = self._data.get(key)
+            if value is None:
+                return None
+            return dict(value)
 
-    def set(self, mode: str, snapshot: Dict[str, Any]) -> None:
-        with self.lock:
-            self.data[mode] = snapshot
-            self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    @staticmethod
-    def now_iso() -> str:
-        return datetime.now(timezone.utc).isoformat()
+    def set(self, key: str, value: dict[str, Any]) -> None:
+        with self._lock:
+            self._data[key] = dict(value)
