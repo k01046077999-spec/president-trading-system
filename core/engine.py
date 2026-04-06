@@ -1,3 +1,4 @@
+import math
 import time
 import numpy as np
 import pandas as pd
@@ -9,6 +10,27 @@ from services.binance import BinanceService
 class PresidentTradingEngine:
     def __init__(self) -> None:
         self.binance = BinanceService()
+
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            num = float(value)
+            if math.isnan(num) or math.isinf(num):
+                return default
+            return num
+        except Exception:
+            return default
+
+    def _sanitize_item(self, item: dict) -> dict:
+        for key in ("stop_pct", "tp1_pct", "tp2_pct", "rr"):
+            if key in item and item[key] is not None:
+                item[key] = self._safe_float(item[key], 0.0)
+        for key in ("warnings", "rejected_by", "errors"):
+            item[key] = [str(x) for x in item.get(key, []) if x is not None]
+        if item.get("reason_summary") is None:
+            item["reason_summary"] = ""
+        if item.get("message") is None:
+            item["message"] = ""
+        return item
 
     def _rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
         delta = series.diff()
@@ -66,13 +88,13 @@ class PresidentTradingEngine:
                 if gap > config.PIVOT_MAX_GAP:
                     break
 
-                p1 = float(lows.iloc[i1])
-                p2 = float(lows.iloc[i2])
+                p1 = self._safe_float(lows.iloc[i1], 0.0)
+                p2 = self._safe_float(lows.iloc[i2], 0.0)
                 if p1 <= 0:
                     continue
                 undercut_pct = ((p1 - p2) / p1) * 100
-                r1 = float(rsi.iloc[i1])
-                r2 = float(rsi.iloc[i2])
+                r1 = self._safe_float(rsi.iloc[i1], 50.0)
+                r2 = self._safe_float(rsi.iloc[i2], 50.0)
                 rsi_gap = r2 - r1
                 price_div = p2 < p1 and undercut_pct <= config.MAX_SECOND_LOW_UNDERCUT_PCT
                 rsi_div = rsi_gap >= config.MIN_RSI_DIVERGENCE_GAP
@@ -86,8 +108,8 @@ class PresidentTradingEngine:
                         i0 = pivots[prev]
                         if i2 - i0 < config.MIN_THREE_POINT_SPAN:
                             continue
-                        p0 = float(lows.iloc[i0])
-                        r0 = float(rsi.iloc[i0])
+                        p0 = self._safe_float(lows.iloc[i0], 0.0)
+                        r0 = self._safe_float(rsi.iloc[i0], 50.0)
                         if p1 <= p0 and r1 >= r0 and r2 >= r1:
                             chain_ok = True
                             chain_anchor = i0
@@ -128,19 +150,19 @@ class PresidentTradingEngine:
             return {"passed": False, "score": 0.0, "reason": "no_valid_divergence"}
 
         i2 = div["i2"]
-        current = float(close.iloc[-1])
-        pivot_low = float(low.iloc[i2])
+        current = self._safe_float(close.iloc[-1], 0.0)
+        pivot_low = self._safe_float(low.iloc[i2], 0.0)
         bounce_from_low_pct = ((current - pivot_low) / pivot_low) * 100 if pivot_low else 999.0
         oversold_rsi = min(div["r1"], div["r2"])
         oversold_ok = oversold_rsi <= config.RSI_OVERSOLD_MAX
         deep_oversold = oversold_rsi <= config.RSI_DEEP_OVERSOLD_MAX
         not_chasing = bounce_from_low_pct <= config.MAX_BOUNCE_FROM_LOW_PCT
 
-        recent_vol = volume.tail(5).mean()
-        prev_vol = volume.iloc[max(0, len(volume) - 15):len(volume) - 5].mean()
+        recent_vol = self._safe_float(volume.tail(5).mean(), 0.0)
+        prev_vol = self._safe_float(volume.iloc[max(0, len(volume) - 15):len(volume) - 5].mean(), 0.0)
         volume_improve = recent_vol >= prev_vol * 1.05 if prev_vol > 0 else False
 
-        crash_20bar_pct = ((current / float(close.iloc[-21])) - 1) * 100 if len(close) >= 21 and float(close.iloc[-21]) > 0 else 0.0
+        crash_20bar_pct = ((current / self._safe_float(close.iloc[-21], 1.0)) - 1) * 100 if len(close) >= 21 and self._safe_float(close.iloc[-21], 0.0) > 0 else 0.0
         crash_filter_ok = crash_20bar_pct > config.CRASH_FILTER_20BAR_PCT
 
         score = 0.0
@@ -191,6 +213,7 @@ class PresidentTradingEngine:
                 "warnings": [],
                 "rejected_by": ["stage1_fail"],
                 "errors": [],
+                "reason_summary": "",
             }
 
         close_1h = df_1h["close"].astype(float)
@@ -200,38 +223,41 @@ class PresidentTradingEngine:
         volume_1h = df_1h["volume"].astype(float)
         ema20_1h = self._ema(close_1h, 20)
         atr_1h = self._atr(df_1h, config.ATR_PERIOD)
-        current = float(close_1h.iloc[-1])
+        current = self._safe_float(close_1h.iloc[-1], 0.0)
 
-        anchor_high = float(high_1h.tail(config.FIB_ANCHOR_LOOKBACK).max())
-        anchor_low = float(low_1h.tail(config.FIB_ANCHOR_LOOKBACK).min())
+        anchor_high = self._safe_float(high_1h.tail(config.FIB_ANCHOR_LOOKBACK).max(), current)
+        anchor_low = self._safe_float(low_1h.tail(config.FIB_ANCHOR_LOOKBACK).min(), current)
         fib = self._fib_levels(anchor_high, anchor_low)
         fib_low = fib["fib_0786"] * (1 - config.FIB_TOLERANCE)
         fib_high = fib["fib_0618"] * (1 + config.FIB_TOLERANCE)
         fib_ok = fib_low <= current <= fib_high
 
-        ema_reclaim_ok = current >= float(ema20_1h.iloc[-1])
-        breakout_ref = float(high_1h.iloc[-(config.MICRO_BREAKOUT_LOOKBACK + 1):-1].max()) if len(high_1h) > config.MICRO_BREAKOUT_LOOKBACK else float(high_1h.iloc[-2])
+        ema_reclaim_ok = current >= self._safe_float(ema20_1h.iloc[-1], current)
+        if len(high_1h) > config.MICRO_BREAKOUT_LOOKBACK:
+            breakout_ref = self._safe_float(high_1h.iloc[-(config.MICRO_BREAKOUT_LOOKBACK + 1):-1].max(), current)
+        else:
+            breakout_ref = self._safe_float(high_1h.iloc[-2], current) if len(high_1h) >= 2 else current
         breakout_ok = current > breakout_ref
-        recent_vol_avg = float(volume_1h.iloc[-6:-1].mean()) if len(volume_1h) >= 6 else float(volume_1h.iloc[:-1].mean())
-        volume_ok = float(volume_1h.iloc[-1]) >= recent_vol_avg * config.VOLUME_SURGE_MULTIPLIER if recent_vol_avg > 0 else False
-        green_candle_ok = current > float(open_1h.iloc[-1])
+        recent_vol_avg = self._safe_float(volume_1h.iloc[-6:-1].mean(), 0.0) if len(volume_1h) >= 6 else self._safe_float(volume_1h.iloc[:-1].mean(), 0.0)
+        volume_ok = self._safe_float(volume_1h.iloc[-1], 0.0) >= recent_vol_avg * config.VOLUME_SURGE_MULTIPLIER if recent_vol_avg > 0 else False
+        green_candle_ok = current > self._safe_float(open_1h.iloc[-1], current)
         entry_ok = ema_reclaim_ok and breakout_ok and volume_ok and green_candle_ok
 
-        structural_stop = min(float(stage1["pivot_low_2"]), anchor_low)
-        stop_price = structural_stop - float(atr_1h.iloc[-1]) * config.ATR_STOP_BUFFER
+        structural_stop = min(self._safe_float(stage1["pivot_low_2"], current), anchor_low)
+        stop_price = structural_stop - self._safe_float(atr_1h.iloc[-1], 0.0) * config.ATR_STOP_BUFFER
         recent_resistance = breakout_ref
         tp1 = max(recent_resistance, current)
         tp2 = current + (current - stop_price) * 2.0
 
-        stop_pct = round(((stop_price - current) / current) * 100, 2)
-        tp1_pct = round(((tp1 - current) / current) * 100, 2)
-        tp2_pct = round(((tp2 - current) / current) * 100, 2)
+        stop_pct = round(((stop_price - current) / current) * 100, 2) if current > 0 else 0.0
+        tp1_pct = round(((tp1 - current) / current) * 100, 2) if current > 0 else 0.0
+        tp2_pct = round(((tp2 - current) / current) * 100, 2) if current > 0 else 0.0
         risk = abs(stop_pct) if stop_pct != 0 else 999.0
         rr = round((max(tp1_pct, 0.0) / risk), 2) if risk > 0 else 0.0
 
         passed, state, warnings, rejected_by = classify_signal(
             mode=mode,
-            stage1_score=float(stage1["score"]),
+            stage1_score=self._safe_float(stage1["score"], 0.0),
             oversold_ok=bool(stage1["oversold_ok"]),
             fib_ok=fib_ok,
             divergence_ok=bool(stage1["price_div"] and stage1["rsi_div"]),
@@ -264,7 +290,7 @@ class PresidentTradingEngine:
 
         message = "진입 가능 구조" if passed and mode == "main" else ("관찰 후보" if passed else "조건 미충족")
 
-        return {
+        return self._sanitize_item({
             "passed": passed,
             "symbol": symbol.replace("/", ""),
             "state": state,
@@ -278,14 +304,14 @@ class PresidentTradingEngine:
             "rejected_by": rejected_by,
             "errors": [],
             "reason_summary": ", ".join(reason) if reason else "구조 불충분",
-        }
+        })
 
     def analyze_symbol(self, symbol: str, mode: str = "main"):
         try:
             sym = symbol if "/" in symbol else symbol.replace("USDT", "/USDT")
             return self._stage2_analyze(sym, mode)
         except Exception as e:
-            return {
+            return self._sanitize_item({
                 "passed": False,
                 "symbol": symbol,
                 "state": "watch",
@@ -293,54 +319,73 @@ class PresidentTradingEngine:
                 "warnings": [],
                 "rejected_by": [],
                 "errors": [f"{type(e).__name__}: {e}"],
-            }
+                "reason_summary": "",
+            })
 
     def scan(self, mode: str = "main", limit: int = 10):
         started = time.time()
         errors = []
         items = []
 
-        universe_top_n = config.UNIVERSE_TOP_N_MAIN if mode == "main" else config.UNIVERSE_TOP_N_SUB
-        stage1_max = config.STAGE1_MAX_MAIN if mode == "main" else config.STAGE1_MAX_SUB
-        stage2_max = config.STAGE2_MAX_MAIN if mode == "main" else config.STAGE2_MAX_SUB
+        try:
+            universe_top_n = config.UNIVERSE_TOP_N_MAIN if mode == "main" else config.UNIVERSE_TOP_N_SUB
+            stage1_max = config.STAGE1_MAX_MAIN if mode == "main" else config.STAGE1_MAX_SUB
+            stage2_max = config.STAGE2_MAX_MAIN if mode == "main" else config.STAGE2_MAX_SUB
 
-        universe = self.binance.get_dynamic_universe(top_n=universe_top_n)
-        stage1_candidates = []
+            universe = self.binance.get_dynamic_universe(top_n=universe_top_n)
+            stage1_candidates = []
 
-        for symbol in universe:
-            if len(stage1_candidates) >= stage1_max:
-                break
-            try:
-                df_1h = self.binance.fetch_ohlcv_df(symbol, "1h", 200)
-                stage1 = self._stage1_check(df_1h)
-                if stage1["passed"]:
-                    stage1_candidates.append(symbol)
-            except Exception as e:
-                errors.append(f"{symbol}: {type(e).__name__}: {e}")
+            for symbol in universe:
+                if len(stage1_candidates) >= stage1_max:
+                    break
+                try:
+                        df_1h = self.binance.fetch_ohlcv_df(symbol, "1h", 200)
+                        stage1 = self._stage1_check(df_1h)
+                        if stage1["passed"]:
+                            stage1_candidates.append(symbol)
+                except Exception as e:
+                    errors.append(f"{symbol}: {type(e).__name__}: {e}")
 
-        for symbol in stage1_candidates[:stage2_max]:
-            result = self._stage2_analyze(symbol, mode)
-            if result["passed"]:
-                items.append(result)
-            elif mode == "sub" and result["state"] == "watch" and not result["errors"]:
-                items.append(result)
+            for symbol in stage1_candidates[:stage2_max]:
+                try:
+                    result = self._stage2_analyze(symbol, mode)
+                    if result["passed"]:
+                        items.append(result)
+                    elif mode == "sub" and result["state"] == "watch" and not result["errors"]:
+                        items.append(result)
+                except Exception as e:
+                    errors.append(f"{symbol}: {type(e).__name__}: {e}")
 
-        items.sort(key=lambda x: (x.get("state") != "ready", -(x.get("rr") or 0)))
-        items = items[:limit]
+            items.sort(key=lambda x: (x.get("state") != "ready", -(x.get("rr") or 0)))
+            items = [self._sanitize_item(x) for x in items[:limit]]
 
-        status = "partial" if errors else "ok"
-        message = f"현재 {mode} 조건을 만족하는 종목이 없습니다." if len(items) == 0 else f"현재 {mode} 조건 후보 {len(items)}개"
+            status = "partial" if errors else "ok"
+            message = f"현재 {mode} 조건을 만족하는 종목이 없습니다." if len(items) == 0 else f"현재 {mode} 조건 후보 {len(items)}개"
 
-        return {
-            "status": status,
-            "mode": mode,
-            "count": len(items),
-            "candidate_pool": len(universe),
-            "stage1_checked": min(len(universe), stage1_max),
-            "stage2_checked": min(len(stage1_candidates), stage2_max),
-            "scan_seconds": round(time.time() - started, 2),
-            "stopped_reason": None,
-            "items": items,
-            "message": message,
-            "errors": errors[:20],
-        }
+            return {
+                "status": status,
+                "mode": mode,
+                "count": len(items),
+                "candidate_pool": len(universe),
+                "stage1_checked": min(len(universe), stage1_max),
+                "stage2_checked": min(len(stage1_candidates), stage2_max),
+                "scan_seconds": round(time.time() - started, 2),
+                "stopped_reason": None,
+                "items": items,
+                "message": message,
+                "errors": [str(e) for e in errors[:20]],
+            }
+        except Exception as e:
+            return {
+                "status": "partial",
+                "mode": mode,
+                "count": 0,
+                "candidate_pool": 0,
+                "stage1_checked": 0,
+                "stage2_checked": 0,
+                "scan_seconds": round(time.time() - started, 2),
+                "stopped_reason": "scan_exception",
+                "items": [],
+                "message": f"{mode} 스캔 실패",
+                "errors": [f"{type(e).__name__}: {e}"],
+            }

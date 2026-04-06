@@ -1,32 +1,21 @@
-# 대통령매매법 v1.9 PDF 정합형
+# President Trading System v1.9.1 Final Fixed
 
-핵심 원칙:
-- 다이버전스는 진입 신호가 아니라 후보 신호
-- PDF 핵심 3요소를 필수 조건으로 승격
-  - RSI 과매도 쾅
-  - 다이버전스 구조(가능하면 3포인트 연계)
-  - 피보나치 0.618~0.786 구간
-- 진입은 후보 이후 확인 단계에서만 허용
-  - 1시간봉 20EMA 회복
-  - 직전 미세 고점 돌파
-  - 거래량 증가 확인
+안정화 수정본.
 
-## v1.9 변경점
-- 저가(low) 기준 다이버전스 탐지 유지
-- 3포인트 다이버전스 연계 우선 탐지
-- RSI 과매도 기준 강화 (`<= 30`, 깊은 과매도 `<= 28`)
-- Fib 0.618~0.786 구간을 사실상 필수화
-- 반등 확인을 `EMA 회복 + 미세고점 돌파 + 거래량 증가`로 재정의
-- 손절은 구조 저점 + ATR 버퍼
-- 익절은 보수적 TP1(최근 저항), TP2(RR 2.0) 구조
-- 메인은 실제 진입용, 서브는 관찰용
+## 핵심 수정
+- `/scan/main`, `/scan/sub`를 캐시 기반으로 변경해서 GPT/브라우저 호출 안정화
+- 실시간 강제 스캔은 `/scan/live/main`, `/scan/live/sub`로 분리
+- 백그라운드 갱신 실패 시 500 대신 stale 캐시/partial 응답 반환
+- NaN / Infinity / null 문제 방지용 sanitize 추가
+- 스캔 범위 소폭 축소로 Render 타임아웃 가능성 감소
 
-## 엔드포인트
+## 권장 GPT 연결 엔드포인트
 - `/health`
-- `/scan/main`
-- `/scan/sub`
-- `/scan/symbol/{symbol}?mode=main`
 - `/gpt/main`
 - `/gpt/sub`
-- `/refresh/main`
-- `/refresh/sub`
+
+## 브라우저 확인용
+- `/scan/main`
+- `/scan/sub`
+- `/scan/live/main`
+- `/scan/live/sub`

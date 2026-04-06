@@ -34,18 +34,44 @@ def _refreshing_payload(mode: str) -> dict:
         "cache_status": "warming",
     }
 
+def _error_payload(mode: str, message: str, detail: str = "") -> dict:
+    return {
+        "status": "partial",
+        "mode": mode,
+        "count": 0,
+        "candidate_pool": 0,
+        "stage1_checked": 0,
+        "stage2_checked": 0,
+        "scan_seconds": 0.0,
+        "stopped_reason": "scan_error",
+        "items": [],
+        "message": message,
+        "errors": [detail] if detail else [],
+        "cache_status": "stale",
+    }
+
 async def _refresh_mode(mode: str) -> None:
     async with refresh_locks[mode]:
-        result = await asyncio.to_thread(engine.scan, mode, 10 if mode == "main" else 12)
-        result["cache_status"] = "fresh"
-        cache.set(mode, result)
+        try:
+            result = await asyncio.to_thread(engine.scan, mode, 10 if mode == "main" else 12)
+            result["cache_status"] = "fresh"
+            cache.set(mode, result)
+        except Exception as e:
+            stale = cache.get(mode)
+            if stale:
+                stale = dict(stale)
+                stale["status"] = "partial"
+                stale["cache_status"] = "stale"
+                stale["message"] = f"{mode} 최신 갱신 실패, 직전 캐시 반환"
+                stale.setdefault("errors", []).append(f"{type(e).__name__}: {e}")
+                cache.set(mode, stale)
+            else:
+                cache.set(mode, _error_payload(mode, f"{mode} 스캔 초기화 실패", f"{type(e).__name__}: {e}"))
 
 async def _loop_refresh(mode: str, interval: int) -> None:
-    await _refresh_mode(mode)
     while True:
+        await _refresh_mode(mode)
         await asyncio.sleep(interval)
-        with suppress(Exception):
-            await _refresh_mode(mode)
 
 def _snapshot(mode: str) -> dict:
     cached = cache.get(mode)
@@ -74,12 +100,26 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok", system="president-trading-system", version=config.APP_VERSION)
 
 @app.get("/scan/main", response_model=ScanResponse, response_model_exclude_none=True)
-def scan_main(limit: int = Query(default=10, ge=1, le=30)) -> ScanResponse:
-    return ScanResponse(**engine.scan(mode="main", limit=limit))
+def scan_main() -> ScanResponse:
+    return ScanResponse(**_snapshot("main"))
 
 @app.get("/scan/sub", response_model=ScanResponse, response_model_exclude_none=True)
-def scan_sub(limit: int = Query(default=12, ge=1, le=40)) -> ScanResponse:
-    return ScanResponse(**engine.scan(mode="sub", limit=limit))
+def scan_sub() -> ScanResponse:
+    return ScanResponse(**_snapshot("sub"))
+
+@app.get("/scan/live/main", response_model=ScanResponse, response_model_exclude_none=True)
+def scan_live_main(limit: int = Query(default=10, ge=1, le=30)) -> ScanResponse:
+    try:
+        return ScanResponse(**engine.scan(mode="main", limit=limit))
+    except Exception as e:
+        return ScanResponse(**_error_payload("main", "main 실시간 스캔 실패", f"{type(e).__name__}: {e}"))
+
+@app.get("/scan/live/sub", response_model=ScanResponse, response_model_exclude_none=True)
+def scan_live_sub(limit: int = Query(default=12, ge=1, le=40)) -> ScanResponse:
+    try:
+        return ScanResponse(**engine.scan(mode="sub", limit=limit))
+    except Exception as e:
+        return ScanResponse(**_error_payload("sub", "sub 실시간 스캔 실패", f"{type(e).__name__}: {e}"))
 
 @app.get("/scan/symbol/{symbol}", response_model=ScanItem, response_model_exclude_none=True)
 def scan_symbol(symbol: str, mode: str = Query(default="main", pattern="^(main|sub)$")) -> ScanItem:

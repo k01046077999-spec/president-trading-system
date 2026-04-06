@@ -7,6 +7,7 @@ class BinanceService:
     def __init__(self) -> None:
         self.exchange = ccxt.binance({
             "enableRateLimit": True,
+            "timeout": 15000,
             "options": {"defaultType": "spot"},
         })
 
@@ -21,9 +22,13 @@ class BinanceService:
             if any(key in symbol for key in config.EXCLUDED_SYMBOL_KEYWORDS):
                 continue
             qv = ticker.get("quoteVolume") or 0
+            try:
+                qv = float(qv)
+            except Exception:
+                qv = 0
             if not qv or qv < config.MIN_QUOTE_VOLUME:
                 continue
-            rows.append((symbol, float(qv)))
+            rows.append((symbol, qv))
         rows.sort(key=lambda x: x[1], reverse=True)
         return [s for s, _ in rows[:top_n]]
 
@@ -31,4 +36,10 @@ class BinanceService:
         ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not ohlcv:
             raise ValueError(f"OHLCV 없음: {symbol} {timeframe}")
-        return pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna().reset_index(drop=True)
+        if df.empty:
+            raise ValueError(f"유효한 OHLCV 없음: {symbol} {timeframe}")
+        return df
