@@ -179,6 +179,41 @@ class PresidentTradingEngine:
             "rsi_lowest": round(oversold_rsi, 2),
         }
 
+    def _pre_main_metrics(self, low_1h: pd.Series, high_1h: pd.Series, close_1h: pd.Series, volume_1h: pd.Series, ema20_1h: pd.Series):
+        current = float(close_1h.iloc[-1])
+        ema_now = float(ema20_1h.iloc[-1]) if len(ema20_1h) else current
+        ema_tight_ok = abs(current - ema_now) / ema_now < config.PRE_MAIN_EMA_TIGHT_PCT if ema_now else False
+
+        recent_lows = low_1h.tail(9).astype(float).tolist()
+        rising_lows_ok = False
+        if len(recent_lows) >= 9:
+            a = min(recent_lows[0:3])
+            b = min(recent_lows[3:6])
+            c = min(recent_lows[6:9])
+            rising_lows_ok = a < b < c
+
+        recent_range = (high_1h - low_1h).astype(float)
+        compression_ok = False
+        if len(recent_range) >= 10:
+            avg_recent = float(recent_range.tail(5).mean())
+            avg_past = float(recent_range.iloc[-10:-5].mean())
+            compression_ok = avg_recent < avg_past * config.PRE_MAIN_VOLATILITY_COMPRESSION_RATIO if avg_past > 0 else False
+
+        volume_alive_ok = False
+        if len(volume_1h) >= 25:
+            recent_vol = float(volume_1h.tail(5).mean())
+            base_vol = float(volume_1h.iloc[-25:-5].mean())
+            volume_alive_ok = recent_vol >= base_vol * config.PRE_MAIN_VOLUME_ALIVE_RATIO if base_vol > 0 else False
+
+        score = int(ema_tight_ok) + int(rising_lows_ok) + int(compression_ok) + int(volume_alive_ok)
+        return {
+            "ema_tight_ok": ema_tight_ok,
+            "rising_lows_ok": rising_lows_ok,
+            "compression_ok": compression_ok,
+            "volume_alive_ok": volume_alive_ok,
+            "pre_main_score": score,
+        }
+
     def _stage2_analyze(self, symbol: str, mode: str):
         df_1h = self.binance.fetch_ohlcv_df(symbol, "1h", 240)
         stage1 = self._stage1_check(df_1h)
@@ -229,6 +264,8 @@ class PresidentTradingEngine:
         risk = abs(stop_pct) if stop_pct != 0 else 999.0
         rr = round((max(tp1_pct, 0.0) / risk), 2) if risk > 0 else 0.0
 
+        pre = self._pre_main_metrics(low_1h, high_1h, close_1h, volume_1h, ema20_1h)
+
         passed, state, warnings, rejected_by = classify_signal(
             mode=mode,
             stage1_score=float(stage1["score"]),
@@ -240,6 +277,11 @@ class PresidentTradingEngine:
             breakout_ok=breakout_ok,
             ema_reclaim_ok=ema_reclaim_ok,
             rr=rr,
+            pre_main_score=pre["pre_main_score"],
+            ema_tight_ok=pre["ema_tight_ok"],
+            rising_lows_ok=pre["rising_lows_ok"],
+            compression_ok=pre["compression_ok"],
+            volume_alive_ok=pre["volume_alive_ok"],
         )
 
         if mode == "main" and not entry_ok and "volume_confirm_fail" not in rejected_by and "micro_breakout_fail" not in rejected_by and "ema_reclaim_fail" not in rejected_by:
@@ -261,8 +303,15 @@ class PresidentTradingEngine:
             reason.append("직전 미세고점 돌파")
         if volume_ok:
             reason.append("거래량 증가 확인")
+        if mode == "pre_main" and pre["pre_main_score"] >= config.PRE_MAIN_MIN_SCORE:
+            reason.append(f"Pre-Main 점수 {pre['pre_main_score']}/4")
 
-        message = "진입 가능 구조" if passed and mode == "main" else ("관찰 후보" if passed else "조건 미충족")
+        if mode == "main":
+            message = "진입 가능 구조" if passed else "조건 미충족"
+        elif mode == "pre_main":
+            message = "곧 돌파 가능성 높은 관찰 후보" if passed else "조건 미충족"
+        else:
+            message = "관찰 후보" if passed else "조건 미충족"
 
         return {
             "passed": passed,
@@ -273,6 +322,7 @@ class PresidentTradingEngine:
             "tp1_pct": tp1_pct,
             "tp2_pct": tp2_pct,
             "rr": rr,
+            "pre_main_score": pre["pre_main_score"] if mode == "pre_main" else None,
             "message": message,
             "warnings": warnings,
             "rejected_by": rejected_by,
@@ -300,9 +350,18 @@ class PresidentTradingEngine:
         errors = []
         items = []
 
-        universe_top_n = config.UNIVERSE_TOP_N_MAIN if mode == "main" else config.UNIVERSE_TOP_N_SUB
-        stage1_max = config.STAGE1_MAX_MAIN if mode == "main" else config.STAGE1_MAX_SUB
-        stage2_max = config.STAGE2_MAX_MAIN if mode == "main" else config.STAGE2_MAX_SUB
+        if mode == "main":
+            universe_top_n = config.UNIVERSE_TOP_N_MAIN
+            stage1_max = config.STAGE1_MAX_MAIN
+            stage2_max = config.STAGE2_MAX_MAIN
+        elif mode == "pre_main":
+            universe_top_n = config.UNIVERSE_TOP_N_PRE_MAIN
+            stage1_max = config.STAGE1_MAX_PRE_MAIN
+            stage2_max = config.STAGE2_MAX_PRE_MAIN
+        else:
+            universe_top_n = config.UNIVERSE_TOP_N_SUB
+            stage1_max = config.STAGE1_MAX_SUB
+            stage2_max = config.STAGE2_MAX_SUB
 
         universe = self.binance.get_dynamic_universe(top_n=universe_top_n)
         stage1_candidates = []
@@ -325,7 +384,10 @@ class PresidentTradingEngine:
             elif mode == "sub" and result["state"] == "watch" and not result["errors"]:
                 items.append(result)
 
-        items.sort(key=lambda x: (x.get("state") != "ready", -(x.get("rr") or 0)))
+        if mode == "pre_main":
+            items.sort(key=lambda x: (-(x.get("pre_main_score") or 0), -(x.get("rr") or 0)))
+        else:
+            items.sort(key=lambda x: (x.get("state") != "ready", -(x.get("rr") or 0)))
         items = items[:limit]
 
         status = "partial" if errors else "ok"

@@ -9,6 +9,11 @@ def classify_signal(
     breakout_ok: bool,
     ema_reclaim_ok: bool,
     rr: float,
+    pre_main_score: int = 0,
+    ema_tight_ok: bool = False,
+    rising_lows_ok: bool = False,
+    compression_ok: bool = False,
+    volume_alive_ok: bool = False,
 ):
     warnings = []
     rejected_by = []
@@ -32,6 +37,34 @@ def classify_signal(
             rejected_by.append("rr_too_low")
         passed = not rejected_by
         return passed, ("ready" if passed else "watch"), warnings, rejected_by
+
+    if mode == "pre_main":
+        if stage1_score < 1.8:
+            rejected_by.append("stage1_score_low")
+        if rr < 0.8:
+            rejected_by.append("rr_too_low")
+        if pre_main_score < 3:
+            rejected_by.append("pre_main_score_low")
+        if breakout_ok:
+            warnings.append("already_breakout")
+        if not oversold_ok:
+            warnings.append("rsi_oversold_fail")
+        if not divergence_ok:
+            warnings.append("divergence_fail")
+        elif not divergence_chain_ok:
+            warnings.append("divergence_chain_not_confirmed")
+        if not fib_ok:
+            warnings.append("fib_zone_not_confirmed")
+        if not ema_tight_ok:
+            warnings.append("ema_not_tight")
+        if not rising_lows_ok:
+            warnings.append("rising_lows_not_confirmed")
+        if not compression_ok:
+            warnings.append("volatility_compression_fail")
+        if not volume_alive_ok:
+            warnings.append("volume_alive_fail")
+        passed = len(rejected_by) == 0
+        return passed, "watch", warnings, rejected_by
 
     if stage1_score < 1.6:
         rejected_by.append("stage1_score_low")
