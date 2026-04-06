@@ -17,7 +17,6 @@ class ScanItem(BaseModel):
     tp1_pct: float | None = None
     tp2_pct: float | None = None
     rr: float | None = None
-    pre_main_score: int | None = None
     message: str = ""
     warnings: list[str] = Field(default_factory=list)
     rejected_by: list[str] = Field(default_factory=list)
