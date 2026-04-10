@@ -233,9 +233,9 @@ class PresidentTradingEngine:
             "rsi_lowest": round(oversold_rsi, 2),
         }
 
-    def _stage2_analyze(self, symbol: str, mode: str):
-        df_1h = self.market.fetch_ohlcv_df(symbol, "1h", 240)
-        stage1 = self._stage1_check(df_1h)
+    def _stage2_analyze(self, symbol: str, mode: str, df_1h: pd.DataFrame | None = None, stage1: dict | None = None):
+        df_1h = df_1h.copy() if df_1h is not None else self.market.fetch_ohlcv_df(symbol, "1h", 240)
+        stage1 = stage1 or self._stage1_check(df_1h)
         if not stage1["passed"]:
             return {
                 "passed": False,
@@ -283,7 +283,7 @@ class PresidentTradingEngine:
         green_candle_ok = current > self._safe_float(open_1h.iloc[-1], current)
 
         # PDF 취지대로 1시간봉 구조를 잡고, 작은 분봉으로 진입 디테일 확인
-        df_15m = self.market.fetch_ohlcv_df(symbol, "15m", 220)
+        df_15m = self.market.fetch_ohlcv_df(symbol, "15m", 180)
         close_15m = df_15m["close"].astype(float)
         high_15m = df_15m["high"].astype(float)
         open_15m = df_15m["open"].astype(float)
@@ -407,7 +407,7 @@ class PresidentTradingEngine:
             stage2_max = config.STAGE2_MAX_MAIN if mode == "main" else config.STAGE2_MAX_SUB
 
             universe = self.market.get_dynamic_universe(top_n=universe_top_n)
-            stage1_candidates = []
+            stage1_candidates: list[tuple[str, pd.DataFrame, dict]] = []
 
             for symbol in universe:
                 if len(stage1_candidates) >= stage1_max:
@@ -416,13 +416,13 @@ class PresidentTradingEngine:
                     df_1h = self.market.fetch_ohlcv_df(symbol, "1h", 200)
                     stage1 = self._stage1_check(df_1h)
                     if stage1["passed"]:
-                        stage1_candidates.append(symbol)
+                        stage1_candidates.append((symbol, df_1h, stage1))
                 except Exception as e:
                     errors.append(f"{symbol}: {type(e).__name__}: {e}")
 
-            for symbol in stage1_candidates[:stage2_max]:
+            for symbol, df_1h, stage1 in stage1_candidates[:stage2_max]:
                 try:
-                    result = self._stage2_analyze(symbol, mode)
+                    result = self._stage2_analyze(symbol, mode, df_1h=df_1h, stage1=stage1)
                     if result["passed"]:
                         items.append(result)
                     elif mode == "sub" and result["state"] == "watch" and not result["errors"]:
@@ -434,7 +434,17 @@ class PresidentTradingEngine:
             items = [self._sanitize_item(x) for x in items[:limit]]
 
             status = "partial" if errors else "ok"
-            message = f"현재 {mode} 조건을 만족하는 종목이 없습니다." if len(items) == 0 else f"현재 {mode} 조건 후보 {len(items)}개"
+            ready_count = sum(1 for x in items if x.get("state") == "ready")
+            watch_count = sum(1 for x in items if x.get("state") == "watch")
+            top_symbols = ", ".join(x.get("symbol", "") for x in items[:3])
+
+            if len(items) == 0:
+                message = f"현재 {mode} 조건을 만족하는 종목이 없습니다. 후보풀 {len(universe)} / 1차통과 {len(stage1_candidates)}"
+            else:
+                suffix = f" | ready {ready_count} / watch {watch_count}"
+                if top_symbols:
+                    suffix += f" | 상위 {top_symbols}"
+                message = f"현재 {mode} 조건 후보 {len(items)}개{suffix}"
 
             return {
                 "status": status,

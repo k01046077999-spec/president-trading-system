@@ -28,7 +28,7 @@ def classify_signal(
             rejected_by.append("micro_breakout_fail")
         if not volume_ok:
             rejected_by.append("volume_confirm_fail")
-        if rr < 1.5:
+        if rr < 1.35:
             rejected_by.append("rr_too_low")
         passed = not rejected_by
         return passed, ("ready" if passed else "watch"), warnings, rejected_by

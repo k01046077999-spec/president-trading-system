@@ -1,5 +1,9 @@
+import time
+from threading import RLock
+
 import ccxt
 import pandas as pd
+
 from core import config
 
 
@@ -9,6 +13,9 @@ class UpbitService:
             "enableRateLimit": True,
             "timeout": 15000,
         })
+        self._lock = RLock()
+        self._universe_cache: dict[int, tuple[float, list[str]]] = {}
+        self._ohlcv_cache: dict[tuple[str, str, int], tuple[float, pd.DataFrame]] = {}
 
     def _to_upbit_symbol(self, symbol: str) -> str:
         s = (symbol or "").strip().upper()
@@ -30,13 +37,29 @@ class UpbitService:
         base = unified.split("/")[0]
         return f"KRW-{base}"
 
+    def _get_cached_universe(self, top_n: int) -> list[str] | None:
+        with self._lock:
+            cached = self._universe_cache.get(top_n)
+            if not cached:
+                return None
+            ts, data = cached
+            if time.time() - ts > config.UNIVERSE_CACHE_TTL_SEC:
+                return None
+            return list(data)
+
+    def _set_cached_universe(self, top_n: int, symbols: list[str]) -> None:
+        with self._lock:
+            self._universe_cache[top_n] = (time.time(), list(symbols))
+
     def get_dynamic_universe(self, top_n: int) -> list[str]:
+        cached = self._get_cached_universe(top_n)
+        if cached is not None:
+            return cached
+
         markets = self.exchange.load_markets()
         krw_symbols = [symbol for symbol, meta in markets.items() if symbol.endswith("/KRW") and meta.get("active") is not False]
         rows: list[tuple[str, float]] = []
 
-        # upbit fetchTickers는 한 번에 너무 많은 심볼을 넣으면 URL 길이 제한에 걸린다.
-        # 따라서 KRW 마켓만 추린 뒤 청크로 나눠 호출한다.
         chunk_size = 80
         for start in range(0, len(krw_symbols), chunk_size):
             chunk = krw_symbols[start:start + chunk_size]
@@ -70,10 +93,31 @@ class UpbitService:
                 rows.append((self._to_upbit_symbol(symbol), qv))
 
         rows.sort(key=lambda x: x[1], reverse=True)
-        return [s for s, _ in rows[:top_n]]
+        result = [s for s, _ in rows[:top_n]]
+        self._set_cached_universe(top_n, result)
+        return result
+
+    def _get_cached_ohlcv(self, key: tuple[str, str, int]) -> pd.DataFrame | None:
+        with self._lock:
+            cached = self._ohlcv_cache.get(key)
+            if not cached:
+                return None
+            ts, data = cached
+            if time.time() - ts > config.OHLCV_CACHE_TTL_SEC:
+                return None
+            return data.copy()
+
+    def _set_cached_ohlcv(self, key: tuple[str, str, int], df: pd.DataFrame) -> None:
+        with self._lock:
+            self._ohlcv_cache[key] = (time.time(), df.copy())
 
     def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         unified = self._to_upbit_symbol(symbol)
+        key = (unified, timeframe, limit)
+        cached = self._get_cached_ohlcv(key)
+        if cached is not None:
+            return cached
+
         ohlcv = self.exchange.fetch_ohlcv(unified, timeframe=timeframe, limit=limit)
         if not ohlcv:
             raise ValueError(f"OHLCV 없음: {unified} {timeframe}")
@@ -83,4 +127,5 @@ class UpbitService:
         df = df.dropna().reset_index(drop=True)
         if df.empty:
             raise ValueError(f"유효한 OHLCV 없음: {unified} {timeframe}")
-        return df
+        self._set_cached_ohlcv(key, df)
+        return df.copy()
