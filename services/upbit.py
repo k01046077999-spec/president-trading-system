@@ -14,6 +14,8 @@ class UpbitService:
             "timeout": 15000,
         })
         self._lock = RLock()
+        self._api_lock = RLock()
+        self._last_api_ts = 0.0
         self._universe_cache: dict[int, tuple[float, list[str]]] = {}
         self._ohlcv_cache: dict[tuple[str, str, int], tuple[float, pd.DataFrame]] = {}
 
@@ -37,6 +39,33 @@ class UpbitService:
         base = unified.split("/")[0]
         return f"KRW-{base}"
 
+    def _sleep_for_rate_limit(self) -> None:
+        with self._api_lock:
+            now = time.time()
+            wait_sec = config.API_MIN_INTERVAL_SEC - (now - self._last_api_ts)
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            self._last_api_ts = time.time()
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return isinstance(exc, ccxt.RateLimitExceeded) or "429" in msg or "too many requests" in msg or "rate limit" in msg
+
+    def _call_api(self, fn, *args, **kwargs):
+        last_exc = None
+        for attempt in range(config.API_RETRY_MAX + 1):
+            try:
+                self._sleep_for_rate_limit()
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_rate_limit_error(exc) or attempt >= config.API_RETRY_MAX:
+                    raise
+                backoff = config.API_BACKOFF_BASE_SEC * (attempt + 1)
+                time.sleep(backoff)
+        if last_exc:
+            raise last_exc
+
     def _get_cached_universe(self, top_n: int) -> list[str] | None:
         with self._lock:
             cached = self._universe_cache.get(top_n)
@@ -56,14 +85,14 @@ class UpbitService:
         if cached is not None:
             return cached
 
-        markets = self.exchange.load_markets()
+        markets = self._call_api(self.exchange.load_markets)
         krw_symbols = [symbol for symbol, meta in markets.items() if symbol.endswith("/KRW") and meta.get("active") is not False]
         rows: list[tuple[str, float]] = []
 
-        chunk_size = 80
+        chunk_size = 60
         for start in range(0, len(krw_symbols), chunk_size):
             chunk = krw_symbols[start:start + chunk_size]
-            tickers = self.exchange.fetch_tickers(chunk)
+            tickers = self._call_api(self.exchange.fetch_tickers, chunk)
 
             for symbol, ticker in tickers.items():
                 if not symbol.endswith("/KRW"):
@@ -118,7 +147,7 @@ class UpbitService:
         if cached is not None:
             return cached
 
-        ohlcv = self.exchange.fetch_ohlcv(unified, timeframe=timeframe, limit=limit)
+        ohlcv = self._call_api(self.exchange.fetch_ohlcv, unified, timeframe=timeframe, limit=limit)
         if not ohlcv:
             raise ValueError(f"OHLCV 없음: {unified} {timeframe}")
         df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
