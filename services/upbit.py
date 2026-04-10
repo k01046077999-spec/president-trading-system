@@ -31,35 +31,43 @@ class UpbitService:
         return f"KRW-{base}"
 
     def get_dynamic_universe(self, top_n: int) -> list[str]:
-        tickers = self.exchange.fetch_tickers()
+        markets = self.exchange.load_markets()
+        krw_symbols = [symbol for symbol, meta in markets.items() if symbol.endswith("/KRW") and meta.get("active") is not False]
         rows: list[tuple[str, float]] = []
 
-        for symbol, ticker in tickers.items():
-            if not symbol.endswith("/KRW"):
-                continue
-            if ticker.get("active") is False:
-                continue
+        # upbit fetchTickers는 한 번에 너무 많은 심볼을 넣으면 URL 길이 제한에 걸린다.
+        # 따라서 KRW 마켓만 추린 뒤 청크로 나눠 호출한다.
+        chunk_size = 80
+        for start in range(0, len(krw_symbols), chunk_size):
+            chunk = krw_symbols[start:start + chunk_size]
+            tickers = self.exchange.fetch_tickers(chunk)
 
-            qv = ticker.get("quoteVolume")
-            if not qv:
-                base_vol = ticker.get("baseVolume") or 0
-                last_price = ticker.get("last") or 0
+            for symbol, ticker in tickers.items():
+                if not symbol.endswith("/KRW"):
+                    continue
+                if ticker.get("active") is False:
+                    continue
+
+                qv = ticker.get("quoteVolume")
+                if not qv:
+                    base_vol = ticker.get("baseVolume") or 0
+                    last_price = ticker.get("last") or 0
+                    try:
+                        qv = float(base_vol) * float(last_price)
+                    except Exception:
+                        qv = 0
+                if not qv:
+                    qv = (((ticker.get("info") or {}).get("acc_trade_price_24h")) or 0)
+
                 try:
-                    qv = float(base_vol) * float(last_price)
+                    qv = float(qv)
                 except Exception:
                     qv = 0
-            if not qv:
-                qv = (((ticker.get("info") or {}).get("acc_trade_price_24h")) or 0)
 
-            try:
-                qv = float(qv)
-            except Exception:
-                qv = 0
+                if qv < config.MIN_QUOTE_VOLUME_KRW:
+                    continue
 
-            if qv < config.MIN_QUOTE_VOLUME_KRW:
-                continue
-
-            rows.append((self._to_upbit_symbol(symbol), qv))
+                rows.append((self._to_upbit_symbol(symbol), qv))
 
         rows.sort(key=lambda x: x[1], reverse=True)
         return [s for s, _ in rows[:top_n]]
