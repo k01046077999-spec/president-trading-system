@@ -1,19 +1,19 @@
-# President Trading System v2.0.2 Upbit KRW Optimized
+# President Trading System v2.0.3 Upbit KRW Optimized
 
-대통령매매법 업비트 KRW 마켓 최적화 보완본.
+대통령매매법 업비트 KRW 마켓 v2.0.3 보완본.
 
 ## 이번 수정 핵심
 - 업비트 KRW 기준 유지
-- `fetch_tickers` URL 길이 문제를 청크 호출로 해결
-- Universe / OHLCV 단기 캐시 추가로 main·sub 중복 호출 부담 축소
-- stage1에서 읽은 1시간봉 데이터를 stage2에 재사용해 중복 네트워크 호출 축소
-- 15분봉 조회 캔들 수 축소로 속도 개선
-- 메인 조건 미세 완화
-  - RSI 과매도 상한 30 → 31.5
-  - 저점 반등 허용폭 10% → 11.5%
-  - RR 하한 1.5 → 1.35
-  - Fib 허용 오차 소폭 확대
-- 응답 메시지에 ready/watch 개수와 상위 심볼 표시
+- stage1 / stage2를 제한된 워커로 병렬화해 스캔 지연 축소
+- 1차 검토 대상을 상위 유동성 종목으로 먼저 압축
+- 메인 판정식을 단순 완화가 아니라 **확인 스택 3개 중 2개 충족** 방식으로 재배열
+- 3포인트 다이버전스 연계는 메인에서 경고 요소로 유지하되 절대 탈락 조건으로 두지 않음
+- 응답 reason_summary에 `확인스택 n/3` 추가
+
+## 기대 효과
+- scan_seconds 하락
+- 메인 0개 빈도 일부 완화
+- 서브는 감시리스트 성격 유지
 
 ## 권장 확인
 - `/health`

@@ -1,5 +1,6 @@
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 from core import config
@@ -322,7 +323,7 @@ class PresidentTradingEngine:
         risk = abs(stop_pct) if stop_pct != 0 else 999.0
         rr = round((max(tp1_pct, 0.0) / risk), 2) if risk > 0 else 0.0
 
-        passed, state, warnings, rejected_by = classify_signal(
+        passed, state, warnings, rejected_by, confirmation_count = classify_signal(
             mode=mode,
             stage1_score=self._safe_float(stage1["score"], 0.0),
             oversold_ok=bool(stage1["oversold_ok"]),
@@ -333,10 +334,11 @@ class PresidentTradingEngine:
             breakout_ok=breakout_ok and breakout_15m_ok,
             ema_reclaim_ok=ema_reclaim_ok and ema_reclaim_15m_ok,
             rr=rr,
+            min_confirmations=config.MIN_MAIN_CONFIRMATIONS if mode == "main" else config.MIN_SUB_CONFIRMATIONS,
         )
 
-        if mode == "main" and not entry_ok and "volume_confirm_fail" not in rejected_by and "micro_breakout_fail" not in rejected_by and "ema_reclaim_fail" not in rejected_by:
-            rejected_by.append("entry_not_confirmed")
+        if mode == "main" and not fib_ok and "fib_zone_fail" not in rejected_by:
+            rejected_by.append("fib_zone_fail")
             passed = False
             state = "watch"
 
@@ -361,6 +363,7 @@ class PresidentTradingEngine:
             reason.append("1시간봉 거래량 증가")
         if ema_reclaim_15m_ok and breakout_15m_ok:
             reason.append("15분봉 진입확인")
+        reason.append(f"확인스택 {confirmation_count}/3")
 
         message = "진입 가능 구조" if passed and mode == "main" else ("관찰 후보" if passed else "조건 미충족")
 
@@ -396,6 +399,14 @@ class PresidentTradingEngine:
                 "reason_summary": "",
             })
 
+    def _stage1_worker(self, symbol: str):
+        df_1h = self.market.fetch_ohlcv_df(symbol, "1h", 200)
+        stage1 = self._stage1_check(df_1h)
+        return symbol, df_1h, stage1
+
+    def _stage2_worker(self, symbol: str, mode: str, df_1h: pd.DataFrame, stage1: dict):
+        return self._stage2_analyze(symbol, mode, df_1h=df_1h, stage1=stage1)
+
     def scan(self, mode: str = "main", limit: int = 10):
         started = time.time()
         errors = []
@@ -407,28 +418,38 @@ class PresidentTradingEngine:
             stage2_max = config.STAGE2_MAX_MAIN if mode == "main" else config.STAGE2_MAX_SUB
 
             universe = self.market.get_dynamic_universe(top_n=universe_top_n)
+            scan_universe = universe[:stage1_max]
             stage1_candidates: list[tuple[str, pd.DataFrame, dict]] = []
 
-            for symbol in universe:
-                if len(stage1_candidates) >= stage1_max:
-                    break
-                try:
-                    df_1h = self.market.fetch_ohlcv_df(symbol, "1h", 200)
-                    stage1 = self._stage1_check(df_1h)
-                    if stage1["passed"]:
-                        stage1_candidates.append((symbol, df_1h, stage1))
-                except Exception as e:
-                    errors.append(f"{symbol}: {type(e).__name__}: {e}")
+            with ThreadPoolExecutor(max_workers=config.STAGE1_WORKERS) as pool:
+                futures = {pool.submit(self._stage1_worker, symbol): symbol for symbol in scan_universe}
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        symbol, df_1h, stage1 = future.result()
+                        if stage1["passed"]:
+                            stage1_candidates.append((symbol, df_1h, stage1))
+                    except Exception as e:
+                        errors.append(f"{symbol}: {type(e).__name__}: {e}")
 
-            for symbol, df_1h, stage1 in stage1_candidates[:stage2_max]:
-                try:
-                    result = self._stage2_analyze(symbol, mode, df_1h=df_1h, stage1=stage1)
-                    if result["passed"]:
-                        items.append(result)
-                    elif mode == "sub" and result["state"] == "watch" and not result["errors"]:
-                        items.append(result)
-                except Exception as e:
-                    errors.append(f"{symbol}: {type(e).__name__}: {e}")
+            stage1_candidates.sort(key=lambda x: (-(x[2].get("score") or 0), x[2].get("bounce_from_low_pct") or 999))
+            stage2_input = stage1_candidates[:stage2_max]
+
+            with ThreadPoolExecutor(max_workers=config.STAGE2_WORKERS) as pool:
+                futures = {
+                    pool.submit(self._stage2_worker, symbol, mode, df_1h, stage1): symbol
+                    for symbol, df_1h, stage1 in stage2_input
+                }
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        result = future.result()
+                        if result["passed"]:
+                            items.append(result)
+                        elif mode == "sub" and result["state"] == "watch" and not result["errors"]:
+                            items.append(result)
+                    except Exception as e:
+                        errors.append(f"{symbol}: {type(e).__name__}: {e}")
 
             items.sort(key=lambda x: (x.get("state") != "ready", -(x.get("rr") or 0)))
             items = [self._sanitize_item(x) for x in items[:limit]]
@@ -439,7 +460,7 @@ class PresidentTradingEngine:
             top_symbols = ", ".join(x.get("symbol", "") for x in items[:3])
 
             if len(items) == 0:
-                message = f"현재 {mode} 조건을 만족하는 종목이 없습니다. 후보풀 {len(universe)} / 1차통과 {len(stage1_candidates)}"
+                message = f"현재 {mode} 조건을 만족하는 종목이 없습니다. 후보풀 {len(universe)} / 1차검토 {len(scan_universe)} / 2차검토 {len(stage2_input)}"
             else:
                 suffix = f" | ready {ready_count} / watch {watch_count}"
                 if top_symbols:
@@ -451,8 +472,8 @@ class PresidentTradingEngine:
                 "mode": mode,
                 "count": len(items),
                 "candidate_pool": len(universe),
-                "stage1_checked": min(len(universe), stage1_max),
-                "stage2_checked": min(len(stage1_candidates), stage2_max),
+                "stage1_checked": len(scan_universe),
+                "stage2_checked": len(stage2_input),
                 "scan_seconds": round(time.time() - started, 2),
                 "stopped_reason": None,
                 "items": items,
