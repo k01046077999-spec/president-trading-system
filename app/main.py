@@ -18,6 +18,7 @@ cache = InMemoryCache()
 refresh_locks = {"main": asyncio.Lock(), "sub": asyncio.Lock()}
 background_tasks = []
 
+
 def _refreshing_payload(mode: str) -> dict:
     return {
         "status": "refreshing",
@@ -34,6 +35,7 @@ def _refreshing_payload(mode: str) -> dict:
         "cache_status": "warming",
     }
 
+
 def _error_payload(mode: str, message: str, detail: str = "") -> dict:
     return {
         "status": "partial",
@@ -49,6 +51,7 @@ def _error_payload(mode: str, message: str, detail: str = "") -> dict:
         "errors": [detail] if detail else [],
         "cache_status": "stale",
     }
+
 
 async def _refresh_mode(mode: str) -> None:
     async with refresh_locks[mode]:
@@ -68,10 +71,12 @@ async def _refresh_mode(mode: str) -> None:
             else:
                 cache.set(mode, _error_payload(mode, f"{mode} 스캔 초기화 실패", f"{type(e).__name__}: {e}"))
 
+
 async def _loop_refresh(mode: str, interval: int) -> None:
     while True:
         await _refresh_mode(mode)
         await asyncio.sleep(interval)
+
 
 def _snapshot(mode: str) -> dict:
     cached = cache.get(mode)
@@ -81,11 +86,13 @@ def _snapshot(mode: str) -> dict:
     payload.setdefault("cache_status", "fresh")
     return payload
 
+
 @app.on_event("startup")
 async def startup_event() -> None:
     background_tasks.clear()
     background_tasks.append(asyncio.create_task(_loop_refresh("main", config.REFRESH_INTERVAL_MAIN)))
     background_tasks.append(asyncio.create_task(_loop_refresh("sub", config.REFRESH_INTERVAL_SUB)))
+
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
@@ -95,17 +102,21 @@ async def shutdown_event() -> None:
         with suppress(asyncio.CancelledError):
             await task
 
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", system="president-trading-system", version=config.APP_VERSION)
+    return HealthResponse(status="ok", system="president-trading-system-upbit", version=config.APP_VERSION)
+
 
 @app.get("/scan/main", response_model=ScanResponse, response_model_exclude_none=True)
 def scan_main() -> ScanResponse:
     return ScanResponse(**_snapshot("main"))
 
+
 @app.get("/scan/sub", response_model=ScanResponse, response_model_exclude_none=True)
 def scan_sub() -> ScanResponse:
     return ScanResponse(**_snapshot("sub"))
+
 
 @app.get("/scan/live/main", response_model=ScanResponse, response_model_exclude_none=True)
 def scan_live_main(limit: int = Query(default=10, ge=1, le=30)) -> ScanResponse:
@@ -114,6 +125,7 @@ def scan_live_main(limit: int = Query(default=10, ge=1, le=30)) -> ScanResponse:
     except Exception as e:
         return ScanResponse(**_error_payload("main", "main 실시간 스캔 실패", f"{type(e).__name__}: {e}"))
 
+
 @app.get("/scan/live/sub", response_model=ScanResponse, response_model_exclude_none=True)
 def scan_live_sub(limit: int = Query(default=12, ge=1, le=40)) -> ScanResponse:
     try:
@@ -121,22 +133,27 @@ def scan_live_sub(limit: int = Query(default=12, ge=1, le=40)) -> ScanResponse:
     except Exception as e:
         return ScanResponse(**_error_payload("sub", "sub 실시간 스캔 실패", f"{type(e).__name__}: {e}"))
 
+
 @app.get("/scan/symbol/{symbol}", response_model=ScanItem, response_model_exclude_none=True)
 def scan_symbol(symbol: str, mode: str = Query(default="main", pattern="^(main|sub)$")) -> ScanItem:
     return ScanItem(**engine.analyze_symbol(symbol.upper(), mode=mode))
+
 
 @app.get("/gpt/main", response_model=ScanResponse, response_model_exclude_none=True)
 def gpt_main() -> ScanResponse:
     return ScanResponse(**_snapshot("main"))
 
+
 @app.get("/gpt/sub", response_model=ScanResponse, response_model_exclude_none=True)
 def gpt_sub() -> ScanResponse:
     return ScanResponse(**_snapshot("sub"))
+
 
 @app.post("/refresh/main", response_model=ScanResponse, response_model_exclude_none=True)
 async def refresh_main() -> ScanResponse:
     await _refresh_mode("main")
     return ScanResponse(**_snapshot("main"))
+
 
 @app.post("/refresh/sub", response_model=ScanResponse, response_model_exclude_none=True)
 async def refresh_sub() -> ScanResponse:
